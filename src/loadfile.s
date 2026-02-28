@@ -8,9 +8,9 @@ print_pointer = $38          ; 2 bytes
 zp_sd_address = $40          ; 2 bytes
 zp_sd_currentsector = $42    ; 4 bytes
 zp_fat32_variables = $46     ; 49 bytes
-copy_swap = $78              ; 4 bytes
-dirent_pointer = $100        ; 2 bytes
-dirent_end_counter = $102    ; 2 bytes
+copy_swap = $7A              ; 4 bytes
+menu_count = $7E             ; 1 byte
+menu_scan_guard = $7F        ; 1 byte
 fat32_workspace = $200       ; 2 pages
 buffer = $400
 
@@ -35,8 +35,6 @@ reset:
 initsuccess:
   ; Open root directory
   jsr fat32_openroot
-  ; Show file menu once at startup
-  jsr list_files
 ;----------------------------------------------
 ; Input prompt
 ;----------------------------------------------
@@ -54,7 +52,7 @@ print_prompt:
   lda #' '
   jsr print_char
 read_prompt_input:
-  jsr get_input
+  jsr get_key
   cmp #'L'
   beq load_file
   cmp #'M'
@@ -130,14 +128,14 @@ foundfile:
   ; Start copy
   jsr start_copy
   ; Return to prompt
-  jsr print_prompt
+  jmp print_prompt
 ;----------------------------------------------
 ; Read in filename
 ;----------------------------------------------
 read_input:
   ldx #0
 read_prefix_next:
-  jsr get_input
+  jsr get_key
   cmp #'.'
   beq period
   cpx #8
@@ -146,16 +144,16 @@ read_prefix_next:
   inx
   jmp read_prefix_next
 period:
+  cpx #8
+  beq max_prefix_character
   lda #' '
   sta input_pointer, x
   inx
-  cpx #8
-  beq max_prefix_character
   jmp period
 read_suffix_next:
   inx
 max_prefix_character:
-  jsr get_input
+  jsr get_key
   cpx #11
   beq max_suffix_character
   cmp #$0D                   ; Enter key
@@ -177,9 +175,9 @@ max_suffix_character:
 read_address:
   ldx #0
 read_address_next:
-  jsr get_input              ; read first digit of hex address,
   cpx #2
   beq read_address_done
+  jsr get_key                ; read first digit of hex address,
   and #$0F                   ; '0'-'9' -> 0-9
   asl                        ; multiply by 2
   sta copy_destination, x    ; temp store in temp
@@ -188,7 +186,7 @@ read_address_next:
   clc
   adc copy_destination, x    ; as result, a = x*8 + x*2
   sta copy_destination, x
-  jsr get_input              ; read second digit of hex address
+  jsr get_key                ; read second digit of hex address
   and #$0F                   ; '0'-'9' -> 0-9
   adc copy_destination, x
   jsr hex_to_dec
@@ -201,76 +199,200 @@ read_address_done:
 ; Print string whos address is in print_pointer
 ;----------------------------------------------
 print_string:
-  ldx #0
 print_string_loop:
-  txa
-  tay
-  lda (print_pointer), y     ; get from string
+  ldy #0
+  lda (print_pointer), y     ; get current char
   beq print_string_exit      ; end of string
-  jsr OUTCH                  ; write to output
-  inx
-  bne print_string_loop      ; do next char
+  jsr print_char             ; OUTCH may clobber Y
+  inc print_pointer
+  bne print_string_loop
+  inc print_pointer+1
+  jmp print_string_loop
 print_string_exit:
+  rts
+;----------------------------------------------
+; Read one stable key from KIM monitor
+; - blocks until non-zero
+; - clears bit 7
+;----------------------------------------------
+get_key:
+  jsr get_input
+  and #$7F
+  beq get_key
   rts
 ;----------------------------------------------
 ; Print root directory file menu
 ;----------------------------------------------
 list_files:
+  lda #0
+  sta menu_count
+  sta menu_scan_guard
+  jsr fat32_openroot
   jsr newline
   ldx #<available_files
   ldy #>available_files
   stx print_pointer
   sty print_pointer+1
   jsr print_string
-  jsr fat32_openroot
-list_files_next:
+list_files_scan_next:
+  inc menu_scan_guard
+  lda menu_scan_guard
+  beq list_files_done         ; stop after 256 scanned entries
   jsr fat32_readdirent
   bcs list_files_done
-  and #$10                   ; Skip directories
-  bne list_files_next
+  and #$18                    ; skip directories and volume labels
+  bne list_files_scan_next
+  jsr has_valid_base_name
+  bcc list_files_scan_next
+  jsr is_playable_file
+  bcc list_files_scan_next
   jsr newline
   lda #' '
   jsr print_char
   lda #' '
   jsr print_char
   jsr print_dirent_name
-  jmp list_files_next
+  inc menu_count
+  lda menu_count
+  cmp #16                     ; cap printed entries
+  bcc list_files_scan_next
+  jsr newline
+  ldx #<files_truncated
+  ldy #>files_truncated
+  stx print_pointer
+  sty print_pointer+1
+  jsr print_string
 list_files_done:
+  lda menu_count
+  bne list_files_restore_root
+  jsr newline
+  ldx #<no_playable_files
+  ldy #>no_playable_files
+  stx print_pointer
+  sty print_pointer+1
+  jsr print_string
+list_files_restore_root:
   jsr fat32_openroot
   rts
 ;----------------------------------------------
-; Print 8.3 filename at current dirent pointer
+; Print current dirent as NAME.EXT
 ;----------------------------------------------
 print_dirent_name:
-  ldy #0
-print_dirent_prefix:
-  cpy #8
-  beq print_dirent_suffix_check
+  ldx #0
+print_dirent_base_loop:
+  cpx #8
+  beq print_dirent_maybe_ext
+  txa
+  tay
   lda (zp_sd_address), y
   cmp #' '
-  beq print_dirent_suffix_check
+  beq print_dirent_maybe_ext
   jsr print_char
-  iny
-  jmp print_dirent_prefix
-print_dirent_suffix_check:
-  ldy #8
+  inx
+  jmp print_dirent_base_loop
+print_dirent_maybe_ext:
+  ldx #8
+  txa
+  tay
   lda (zp_sd_address), y
   cmp #' '
   beq print_dirent_done
   lda #'.'
   jsr print_char
-print_dirent_suffix:
-  cpy #11
+print_dirent_ext_loop:
+  cpx #11
   beq print_dirent_done
+  txa
+  tay
   lda (zp_sd_address), y
   cmp #' '
   beq print_dirent_done
   jsr print_char
-  iny
-  jmp print_dirent_suffix
+  inx
+  jmp print_dirent_ext_loop
 print_dirent_done:
   rts
 ;----------------------------------------------
+; Return C=1 if dirent extension is playable
+; supports: .Z1/.Z2/.Z3/.Z4/.Z5/.Z8 and .DAT
+;----------------------------------------------
+is_playable_file:
+  ldy #8
+  lda (zp_sd_address), y
+  cmp #'Z'
+  beq is_playable_z
+  cmp #'D'
+  bne is_playable_no
+  iny
+  lda (zp_sd_address), y
+  cmp #'A'
+  bne is_playable_no
+  iny
+  lda (zp_sd_address), y
+  cmp #'T'
+  bne is_playable_no
+  sec
+  rts
+is_playable_z:
+  iny
+  lda (zp_sd_address), y
+  cmp #'1'
+  beq is_playable_z_ok
+  cmp #'2'
+  beq is_playable_z_ok
+  cmp #'3'
+  beq is_playable_z_ok
+  cmp #'4'
+  beq is_playable_z_ok
+  cmp #'5'
+  beq is_playable_z_ok
+  cmp #'8'
+  bne is_playable_no
+is_playable_z_ok:
+  iny
+  lda (zp_sd_address), y
+  cmp #' '
+  bne is_playable_no
+  sec
+  rts
+is_playable_no:
+  clc
+  rts
+;----------------------------------------------
+; Return C=1 if name[0..7] has at least one char and all used chars are A-Z/0-9
+;----------------------------------------------
+has_valid_base_name:
+  lda #0
+  sta copy_destination
+  ldy #0
+has_valid_base_name_loop:
+  cpy #8
+  beq has_valid_base_name_done
+  lda (zp_sd_address), y
+  cmp #' '
+  beq has_valid_base_name_done
+  cmp #'0'
+  bcc has_valid_base_name_no
+  cmp #'9'+1
+  bcc has_valid_base_name_mark_used
+  cmp #'A'
+  bcc has_valid_base_name_no
+  cmp #'Z'+1
+  bcs has_valid_base_name_no
+has_valid_base_name_mark_used:
+  lda #1
+  sta copy_destination
+  iny
+  jmp has_valid_base_name_loop
+has_valid_base_name_done:
+  lda copy_destination
+  bne has_valid_base_name_yes
+has_valid_base_name_no:
+  clc
+  rts
+has_valid_base_name_yes:
+  sec
+  rts
 ; Hex to decimal converter
 ;----------------------------------------------
 hex_to_dec:
@@ -327,6 +449,10 @@ help_menu:
   .asciiz "H    Print help"
 available_files:
   .asciiz "Available files"
+no_playable_files:
+  .asciiz "  (no playable files found)"
+files_truncated:
+  .asciiz "  ...more files omitted"
 input_filename:
   .asciiz "Input filename > "
 file_not_found:

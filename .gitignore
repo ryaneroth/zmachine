@@ -1,0 +1,8 @@
+.vscode
+*.lst
+*.map
+*.o
+*.ptp
+*.py
+*.pyc
+*.log

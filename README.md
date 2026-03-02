@@ -2,6 +2,8 @@
 
 This project is the follow-on to our KIM-1 Adventure work: porting/creating a Z-machine-capable runtime for the KIM-1.
 
+![Zork I](zork.png)
+
 It reuses the SD/FAT32 libraries that were polished during the Adventure effort, so story/game data can be loaded from SD card storage.
 
 ## Project Goal

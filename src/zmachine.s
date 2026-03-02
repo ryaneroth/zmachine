@@ -1453,14 +1453,15 @@ z_get_local_word:
 z_set_local_word:
   ; var id in Y (1..15), value in A/X
   sty z_tmp2
-  lda z_fp
-  ora z_fp+1
-  bne :+
-  rts
-:
   sta z_tmp
   txa
   pha
+  lda z_fp
+  ora z_fp+1
+  bne :+
+  pla
+  rts
+:
   lda z_tmp2
   sec
   sbc #1
@@ -2865,13 +2866,17 @@ op_2op_dec_chk:
   lda z_work_ptr+1
   sbc #0
   sta z_work_ptr+1
+  lda z_work_ptr
+  sta z_tmp
+  lda z_work_ptr+1
+  sta z_tmp2
   ldy z_op1_lo
   lda z_work_ptr
   ldx z_work_ptr+1
   jsr z_set_var_word
-  lda z_work_ptr
+  lda z_tmp
   sta z_op1_lo
-  lda z_work_ptr+1
+  lda z_tmp2
   sta z_op1_hi
   jmp op_2op_jl
 
@@ -2888,13 +2893,17 @@ op_2op_inc_chk:
   lda z_work_ptr+1
   adc #0
   sta z_work_ptr+1
+  lda z_work_ptr
+  sta z_tmp
+  lda z_work_ptr+1
+  sta z_tmp2
   ldy z_op1_lo
   lda z_work_ptr
   ldx z_work_ptr+1
   jsr z_set_var_word
-  lda z_work_ptr
+  lda z_tmp
   sta z_op1_lo
-  lda z_work_ptr+1
+  lda z_tmp2
   sta z_op1_hi
   jmp op_2op_jg
 
@@ -3477,9 +3486,11 @@ op_1op_get_sibling:
 :
   tay
   lda z_work_ptr
+  sta z_tmp
+  lda z_work_ptr
   ldx z_work_ptr+1
   jsr z_set_var_word
-  lda z_work_ptr
+  lda z_tmp
   beq :+
   lda #1
   jmp z_branch_on_bool
@@ -3499,9 +3510,11 @@ op_1op_get_child:
 :
   tay
   lda z_work_ptr
+  sta z_tmp
+  lda z_work_ptr
   ldx z_work_ptr+1
   jsr z_set_var_word
-  lda z_work_ptr
+  lda z_tmp
   beq :+
   lda #1
   jmp z_branch_on_bool
@@ -3704,11 +3717,17 @@ op_1op_not:
 
 z_branch_on_bool:
   ; Input A: 0=false, nonzero=true.
-  ; Save bool on stack ??? z_tmp is clobbered by zm_fetch_byte via z_mem_read_byte_ax.
-  pha
+  ; Normalize and preserve bool in scratch across zm_fetch_byte.
+  beq :+
+  lda #1
+  bne :++
+:
+  lda #0
+:
+  sta z_work_cnt
+
   jsr zm_fetch_byte
   bcc :+
-  pla
   jmp zm_stop
 :
   sta z_tmp2
@@ -3762,10 +3781,7 @@ z_branch_two_byte:
   sta z_branch_off
 
 z_branch_eval:
-  pla               ; restore original bool (was saved before first fetch)
-  beq :+
-  lda #1
-:
+  lda z_work_cnt
   cmp z_branch_cond
   beq z_branch_taken
   clc

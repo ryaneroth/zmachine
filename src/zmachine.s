@@ -5695,4 +5695,4 @@ z_bit_mask:
   .include "../sdcard6502/src/hwconfig.s"
   .include "../sdcard6502/src/libsd.s"
   .include "../sdcard6502/src/libfat32.s"
-    .include "libio.s"
+  .include "../sdcard6502/src/libio.s"

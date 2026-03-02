@@ -1,6 +1,6 @@
 # KIM-1 Z-Machine (WIP)
 
-This project is the follow-on to our KIM-1 Adventure work: porting/creating a Z-machine-capable runtime for the KIM-1.
+This project is a Z-machine-capable runtime for the KIM-1.
 
 ![Zork I](zork.png)
 

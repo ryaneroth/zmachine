@@ -1235,6 +1235,24 @@ z_mem_read_byte_ax:
   bcc z_mem_read_dynamic
 
 z_mem_read_static:
+  ; Fast path for sequential static reads:
+  ; if requested 16-bit address == current stream position and stream position
+  ; is still within first 64KB, read directly from current sector pointer.
+  lda z_story_pos+2
+  bne z_mem_read_static_slow
+  lda z_tmp
+  cmp z_story_pos
+  bne z_mem_read_static_slow
+  lda z_tmp2
+  cmp z_story_pos+1
+  bne z_mem_read_static_slow
+  jsr fat32_file_readbyte
+  bcs z_mem_read_static_fail
+  jsr story_pos_inc
+  clc
+  rts
+
+z_mem_read_static_slow:
   lda z_tmp
   sta z_story_target
   lda z_tmp2
@@ -1242,6 +1260,10 @@ z_mem_read_static:
   lda #0
   sta z_story_target+2
   jmp story_read_byte_at_target
+
+z_mem_read_static_fail:
+  sec
+  rts
 
 z_mem_read_dynamic:
   ; pointer = z_dynamic_base + AX
@@ -3705,12 +3727,18 @@ z_branch_cond_set:
   and #$40
   beq z_branch_two_byte
 
-  ; one-byte branch offset: 6-bit UNSIGNED value 0..63 (spec 4.7).
-  ; Do NOT sign-extend; only the 2-byte form has a signed offset.
+  ; one-byte branch offset: 6-bit signed value (-32..31).
   lda z_tmp2
   and #$3F
   sta z_branch_off
+  lda z_branch_off
+  and #$20
+  beq :+
+  lda #$FF
+  bne :++
+:
   lda #0
+:
   sta z_branch_off_hi
   jmp z_branch_eval
 
@@ -5241,11 +5269,37 @@ zm_append_operand_word:
 ; Fetch one byte from story at z_pc, then increment z_pc.
 ; Uses RAM for dynamic region (< static_base), SD stream for static.
 zm_fetch_byte:
+  ; Hot-path optimization: sequential static fetch at current stream position.
+  lda z_pc+1
+  cmp z_static_base+1
+  bcc zm_fetch_slow
+  bne zm_fetch_static_try
+  lda z_pc
+  cmp z_static_base
+  bcc zm_fetch_slow
+
+zm_fetch_static_try:
+  lda z_story_pos+2
+  bne zm_fetch_slow
+  lda z_pc
+  cmp z_story_pos
+  bne zm_fetch_slow
+  lda z_pc+1
+  cmp z_story_pos+1
+  bne zm_fetch_slow
+
+  jsr fat32_file_readbyte
+  bcs zm_fetch_fail
+  jsr story_pos_inc
+  jmp zm_fetch_inc_pc
+
+zm_fetch_slow:
   lda z_pc
   ldx z_pc+1
   jsr z_mem_read_byte_ax
   bcs zm_fetch_fail
 
+zm_fetch_inc_pc:
   inc z_pc
   bne :+
   inc z_pc+1
@@ -5289,7 +5343,7 @@ z_decode_zstring_at_ptr:
 z_decode_word_loop:
   lda z_zs_ptr
   ldx z_zs_ptr+1
-  jsr story_read_byte_ax
+  jsr z_mem_read_byte_ax
   bcs z_decode_fail
   sta z_zs_word_hi
   inc z_zs_ptr
@@ -5298,7 +5352,7 @@ z_decode_word_loop:
 :
   lda z_zs_ptr
   ldx z_zs_ptr+1
-  jsr story_read_byte_ax
+  jsr z_mem_read_byte_ax
   bcs z_decode_fail
   sta z_zs_word_lo
   inc z_zs_ptr

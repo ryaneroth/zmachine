@@ -63,6 +63,12 @@ z_div_signr          = $74
 z_rng_state_lo       = $75
 z_rng_state_hi       = $76
 z_object_table       = $77   ; 16-bit object table address
+z_story_startcluster = $8C   ; 4-byte first cluster of open story file
+z_story_filesize     = $90   ; 4-byte total file size of open story file
+z_seek_tsec_lo       = $94   ; seek scratch: target sector (lo) - private to story_seek_to_target
+z_seek_tsec_hi       = $95   ; seek scratch: target sector (hi)
+z_seek_csec_lo       = $96   ; seek scratch: current sector (lo)
+z_seek_csec_hi       = $97   ; seek scratch: current sector (hi)
 z_prop_ptr           = $80   ; 16-bit property scan/data pointer
 z_prop_num           = $82   ; property number scratch
 z_prop_size          = $83   ; property size scratch
@@ -593,6 +599,11 @@ select_story:
   sty z_print_ptr+1
   jsr print_string
   jsr print_buffer_name
+  ldx #<msg_ellipsis
+  ldy #>msg_ellipsis
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
   clc
   rts
 
@@ -672,6 +683,32 @@ story_rewind_open:
   ldy #>story_name
   jsr fat32_finddirent
   bcs story_rewind_fail
+  ; Save first cluster and file size before fat32_opendirent walks the chain.
+  ; fat32_finddirent leaves zp_sd_address pointing at the dirent.
+  ldy #26
+  lda (zp_sd_address),y
+  sta z_story_startcluster
+  iny
+  lda (zp_sd_address),y
+  sta z_story_startcluster+1
+  ldy #20
+  lda (zp_sd_address),y
+  sta z_story_startcluster+2
+  iny
+  lda (zp_sd_address),y
+  sta z_story_startcluster+3
+  ldy #28
+  lda (zp_sd_address),y
+  sta z_story_filesize
+  iny
+  lda (zp_sd_address),y
+  sta z_story_filesize+1
+  iny
+  lda (zp_sd_address),y
+  sta z_story_filesize+2
+  iny
+  lda (zp_sd_address),y
+  sta z_story_filesize+3
   jsr fat32_opendirent
   lda #0
   sta z_story_pos
@@ -730,8 +767,8 @@ boot_story:
   bcc :+
   jmp boot_fail
 :
-  sta z_story_initialpc
-  stx z_story_initialpc+1
+  stx z_story_initialpc       ; lo byte
+  sta z_story_initialpc+1     ; hi byte
 
   lda z_story_initialpc
   sta z_pc
@@ -879,49 +916,211 @@ story_read_word_at_target:
   sec
   rts
 
-; Ensure stream is positioned at z_story_target.
-; Rewinds/open if target is behind current position.
+; Seek the story stream to exactly z_story_target (24-bit byte offset).
+; Three tiers:
+;   A) Already positioned (target == pos): instant return.
+;   B) Same sector (target >> 9 == pos >> 9): reposition zp_sd_address only.
+;   C) Next sequential sector: one fat32_readnextsector call.
+;   D) Any other seek: FAT cluster-chain walk from file start + one sector read.
+; On return: C clear = success, C set = error.
 story_seek_to_target:
-  ; If target < pos, rewind.
-  lda z_story_target+2
-  cmp z_story_pos+2
-  bcc seek_need_rewind
-  bne seek_forward
-  lda z_story_target+1
-  cmp z_story_pos+1
-  bcc seek_need_rewind
-  bne seek_forward
+  ; ------------------------------------------------------------------
+  ; Tier A: already at target position, nothing to do.
+  ; ------------------------------------------------------------------
   lda z_story_target
   cmp z_story_pos
-  bcc seek_need_rewind
+  bne seek_check_sector
+  lda z_story_target+1
+  cmp z_story_pos+1
+  bne seek_check_sector
+  lda z_story_target+2
+  cmp z_story_pos+2
+  bne seek_check_sector
+  jmp seek_pos_done
 
-seek_forward:
-  ; Consume forward bytes until pos == target
-seek_loop:
-  lda z_story_pos
-  cmp z_story_target
-  bne seek_step
-  lda z_story_pos+1
-  cmp z_story_target+1
-  bne seek_step
+seek_check_sector:
+  ; ------------------------------------------------------------------
+  ; Compute target_sector = z_story_target >> 9 into z_seek_tsec.
+  ; (Uses dedicated scratch to avoid clobbering z_tmp/z_tmp2/z_work_ptr
+  ;  which callers may hold live across story_read_byte_at_target calls.)
+  ; ------------------------------------------------------------------
+  lda z_story_target+2
+  lsr
+  sta z_seek_tsec_hi
+  lda z_story_target+1
+  ror
+  sta z_seek_tsec_lo
+
+  ; ------------------------------------------------------------------
+  ; Compute cur_sector = z_story_pos >> 9 into z_seek_csec.
+  ; ------------------------------------------------------------------
   lda z_story_pos+2
-  cmp z_story_target+2
-  beq seek_done
+  lsr
+  sta z_seek_csec_hi
+  lda z_story_pos+1
+  ror
+  sta z_seek_csec_lo
 
-seek_step:
-  jsr fat32_file_readbyte
+  ; ------------------------------------------------------------------
+  ; Tier B: same sector — reposition zp_sd_address within the buffer.
+  ; ------------------------------------------------------------------
+  lda z_seek_tsec_lo
+  cmp z_seek_csec_lo
+  bne seek_check_next
+  lda z_seek_tsec_hi
+  cmp z_seek_csec_hi
+  bne seek_check_next
+  ; Same sector: just point into the already-loaded buffer.
+  lda z_story_target
+  sta zp_sd_address
+  lda z_story_target+1
+  and #$01
+  ora #>fat32_readbuffer
+  sta zp_sd_address+1
+  jmp seek_update_pos
+
+  ; ------------------------------------------------------------------
+  ; Tier C: next sequential sector — one fat32_readnextsector call.
+  ; ------------------------------------------------------------------
+seek_check_next:
+  clc
+  lda z_seek_csec_lo
+  adc #1
+  cmp z_seek_tsec_lo
+  bne seek_full
+  lda z_seek_csec_hi
+  adc #0
+  cmp z_seek_tsec_hi
+  bne seek_full
+  ; Target is exactly one sector ahead.
+  lda #<fat32_readbuffer
+  sta fat32_address
+  lda #>fat32_readbuffer
+  sta fat32_address+1
+  jsr fat32_readnextsector
+  bcc :+
+  jmp seek_fail
+:
+  lda z_story_target
+  sta zp_sd_address
+  lda z_story_target+1
+  and #$01
+  ora #>fat32_readbuffer
+  sta zp_sd_address+1
+  jmp seek_update_pos
+
+  ; ------------------------------------------------------------------
+  ; Tier D: arbitrary seek — walk FAT chain from file start.
+  ; ------------------------------------------------------------------
+seek_full:
+  lda z_story_startcluster
+  sta fat32_nextcluster
+  lda z_story_startcluster+1
+  sta fat32_nextcluster+1
+  lda z_story_startcluster+2
+  sta fat32_nextcluster+2
+  lda z_story_startcluster+3
+  sta fat32_nextcluster+3
+
+  ; First cluster: force FAT sector load (clc), because a data-sector read may
+  ; have overwritten fat32_readbuffer since the last fat32_seekcluster call.
+  clc
+  jmp seek_cluster_entry
+
+seek_cluster_walk:
+  ; Subsequent clusters within this walk: FAT sector is already in the buffer.
+  sec
+
+seek_cluster_entry:
+  jsr fat32_seekcluster
+  bcc :+
+  jmp seek_fail
+:
+  lda z_seek_tsec_hi
+  bne seek_subtract_spc
+  lda z_seek_tsec_lo
+  cmp fat32_pendingsectors
+  bcc seek_cluster_found
+
+seek_subtract_spc:
+  sec
+  lda z_seek_tsec_lo
+  sbc fat32_pendingsectors
+  sta z_seek_tsec_lo
+  bcs :+
+  dec z_seek_tsec_hi
+:
+  jmp seek_cluster_walk
+
+seek_cluster_found:
+  ; Advance zp_sd_currentsector to the target sector within the cluster.
+  clc
+  lda zp_sd_currentsector
+  adc z_seek_tsec_lo
+  sta zp_sd_currentsector
+  bcc :+
+  inc zp_sd_currentsector+1
+  bne :+
+  inc zp_sd_currentsector+2
+  bne :+
+  inc zp_sd_currentsector+3
+:
+  ; Remaining sectors in this cluster after the read.
+  sec
+  lda fat32_pendingsectors
+  sbc z_seek_tsec_lo
+  sbc #1
+  sta fat32_pendingsectors
+  ; Read the target sector.
+  lda #<fat32_readbuffer
+  sta zp_sd_address
+  lda #>fat32_readbuffer
+  sta zp_sd_address+1
+  jsr sd_readsector
   bcs seek_fail
-  jsr story_pos_inc
-  jmp seek_loop
+  ; Advance sector pointer past the sector just read.
+  inc zp_sd_currentsector
+  bne :+
+  inc zp_sd_currentsector+1
+  bne :+
+  inc zp_sd_currentsector+2
+  bne :+
+  inc zp_sd_currentsector+3
+:
+  ; Reposition within the buffer.
+  lda z_story_target
+  sta zp_sd_address
+  lda z_story_target+1
+  and #$01
+  ora #>fat32_readbuffer
+  sta zp_sd_address+1
 
-seek_need_rewind:
-  jsr story_rewind_open
-  bcs seek_fail
-  jmp seek_forward
+seek_update_pos:
+  ; Update fat32_bytesremaining = file_size - z_story_target.
+  sec
+  lda z_story_filesize
+  sbc z_story_target
+  sta fat32_bytesremaining
+  lda z_story_filesize+1
+  sbc z_story_target+1
+  sta fat32_bytesremaining+1
+  lda z_story_filesize+2
+  sbc z_story_target+2
+  sta fat32_bytesremaining+2
+  lda z_story_filesize+3
+  sbc #0
+  sta fat32_bytesremaining+3
 
-seek_done:
+seek_pos_done:
+  lda z_story_target
+  sta z_story_pos
+  lda z_story_target+1
+  sta z_story_pos+1
+  lda z_story_target+2
+  sta z_story_pos+2
   clc
   rts
+
 seek_fail:
   sec
   rts
@@ -1351,45 +1550,41 @@ z_call_zero_locals:
 z_call_load_defaults:
   lda #0
   sta z_idx
-z_call_default_loop:
-  lda z_idx
-  cmp z_tmp2
-  beq z_call_apply_args
-  ; addr = routine + 1 + (idx*2)
-  lda z_work_ptr
-  clc
-  adc #1
-  sta z_story_target
-  lda z_work_ptr+1
-  adc #0
-  sta z_story_target+1
-  lda #0
-  sta z_story_target+2
-  lda z_idx
-  asl
-  clc
-  adc z_story_target
-  sta z_story_target
-  bcc :+
-  inc z_story_target+1
+  ; Advance z_work_ptr to first local default word (routine_base + 1).
+  ; z_mem_read_word_ax overwrites z_work_ptr with the address it reads, ending
+  ; up at original+1.  We inc by 1 more each iteration so it advances 2 bytes
+  ; per word.  After the loop z_work_ptr = routine_base + 1 + 2*num_locals,
+  ; which is exactly the first instruction address (used by z_call_set_pc).
+  inc z_work_ptr
+  bne :+
+  inc z_work_ptr+1
 :
-  lda z_story_target
-  ldx z_story_target+1
-  jsr z_mem_read_word_ax
+z_call_default_loop:
+  ldy #5
+  lda (z_fp),y       ; num_locals from frame (z_tmp2 clobbered by z_mem_read_byte_ax)
+  cmp z_idx
+  beq z_call_apply_args
+  ; Read default word at running pointer.
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_word_ax   ; A=lo, X=hi; z_work_ptr = (original)+1
   bcc :+
   jmp z_call_fail
 :
-  ; local slot addr = frame + 6 + idx*2
-  ldy z_idx
-  tya
+  ; Advance pointer by 1 more so it points to next default word.
+  inc z_work_ptr
+  bne :+
+  inc z_work_ptr+1
+:
+  ; Store A=lo, X=hi into frame slot [6 + z_idx*2].
+  ; Save lo (A) on stack while computing Y offset — tya/asl would clobber A.
+  pha
+  lda z_idx
   asl
+  clc
+  adc #6
   tay
-  iny
-  iny
-  iny
-  iny
-  iny
-  iny
+  pla
   sta (z_fp),y
   iny
   txa
@@ -1410,11 +1605,11 @@ z_call_apply_args:
   lda #3
   sta z_idx
 :
-  lda z_idx
-  cmp z_tmp2
-  bcc :+
-  lda z_tmp2
-  sta z_idx
+  ldy #5
+  lda (z_fp),y       ; num_locals from frame
+  cmp z_idx
+  bcs :+             ; num_locals >= z_idx, keep z_idx
+  sta z_idx          ; cap z_idx to num_locals
 :
   lda z_idx
   beq z_call_set_pc
@@ -1447,21 +1642,12 @@ z_call_apply_args:
   sta (z_fp),y
 
 z_call_set_pc:
-  ; new pc = routine + 1 + 2*num_locals
-  lda z_tmp2
-  asl
-  sta z_story_target
-  lda #0
-  rol
-  sta z_story_target+1
-  clc
+  ; z_work_ptr = routine_base + 1 + 2*num_locals = first instruction address.
+  ; The default loop maintained z_work_ptr as a running pointer, so it is
+  ; already correct regardless of how many locals were loaded.
   lda z_work_ptr
-  adc #1
-  adc z_story_target
   sta z_pc
   lda z_work_ptr+1
-  adc #0
-  adc z_story_target+1
   sta z_pc+1
   clc
   rts
@@ -1527,20 +1713,24 @@ z_mem_read_word_ax:
   ldx z_work_ptr+1
   jsr z_mem_read_byte_ax
   bcs z_mem_read_word_fail
-  sta z_tmp
+  pha                    ; save hi byte on stack (second jsr clobbers z_tmp)
   inc z_work_ptr
   bne :+
   inc z_work_ptr+1
 :
   lda z_work_ptr
   ldx z_work_ptr+1
-  jsr z_mem_read_byte_ax
-  bcs z_mem_read_word_fail
-  ldx z_tmp
-  ; A already contains low byte, X now contains high byte.
+  jsr z_mem_read_byte_ax   ; lo byte -> A
+  bcs z_mem_read_word_fail_pull
+  sta z_tmp              ; save lo byte
+  pla                    ; hi byte -> A
+  tax                    ; hi -> X
+  lda z_tmp              ; lo -> A
   clc
   rts
 
+z_mem_read_word_fail_pull:
+  pla
 z_mem_read_word_fail:
   sec
   rts
@@ -2158,7 +2348,8 @@ zm_step:
   jmp zm_handle_short_1op
 :
 
-  ; 0OP subset
+  ; 0OP / VAR form subset — reload opcode (A was contaminated by and #$C0 above)
+  lda z_opcode
   cmp #$B0            ; rtrue
   bne :+
   jmp op_rtrue
@@ -3445,10 +3636,12 @@ op_1op_not:
   rts
 
 z_branch_on_bool:
-  ; Input A: 0=false, nonzero=true
-  sta z_tmp
+  ; Input A: 0=false, nonzero=true.
+  ; Save bool on stack — z_tmp is clobbered by zm_fetch_byte via z_mem_read_byte_ax.
+  pha
   jsr zm_fetch_byte
   bcc :+
+  pla
   jmp zm_stop
 :
   sta z_tmp2
@@ -3467,41 +3660,36 @@ z_branch_cond_set:
   and #$40
   beq z_branch_two_byte
 
-  ; one-byte branch offset (6-bit signed)
+  ; one-byte branch offset: 6-bit UNSIGNED value 0..63 (spec 4.7).
+  ; Do NOT sign-extend; only the 2-byte form has a signed offset.
   lda z_tmp2
   and #$3F
   sta z_branch_off
-  and #$20
-  beq :+
-  lda #$FF
-  sta z_branch_off_hi
-  lda z_branch_off
-  ora #$C0
-  sta z_branch_off
-  jmp z_branch_eval
-:
   lda #0
   sta z_branch_off_hi
   jmp z_branch_eval
 
 z_branch_two_byte:
-  jsr zm_fetch_byte
-  bcc :+
-  jmp zm_stop
-:
-  sta z_branch_off
+  ; Compute z_branch_off_hi from z_tmp2 BEFORE the second fetch clobbers z_tmp2.
   lda z_tmp2
   and #$3F
   sta z_branch_off_hi
   lda z_branch_off_hi
   and #$20
-  beq z_branch_eval
+  beq :+
   lda z_branch_off_hi
   ora #$C0
   sta z_branch_off_hi
+:
+  jsr zm_fetch_byte
+  bcc :+
+  pla
+  jmp zm_stop
+:
+  sta z_branch_off
 
 z_branch_eval:
-  lda z_tmp
+  pla               ; restore original bool (was saved before first fetch)
   beq :+
   lda #1
 :
@@ -4638,37 +4826,50 @@ zm_decode_var_operands:
 
   ; slot 1
   lda z_tmp
+  pha               ; save type-shift register (zm_decode_one_typed_operand clobbers z_tmp)
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp
-  asl z_tmp
+  bcs zm_decode_var_fail_pull
+  pla
+  asl
+  asl
+  sta z_tmp
 
   ; slot 2
   lda z_tmp
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp
-  asl z_tmp
+  bcs zm_decode_var_fail_pull
+  pla
+  asl
+  asl
+  sta z_tmp
 
   ; slot 3
   lda z_tmp
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp
-  asl z_tmp
+  bcs zm_decode_var_fail_pull
+  pla
+  asl
+  asl
+  sta z_tmp
 
   ; slot 4
   lda z_tmp
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
+  bcs zm_decode_var_fail_pull
+  pla               ; discard (done with shift register)
 
   clc
   rts
 
+zm_decode_var_fail_pull:
+  pla
 zm_decode_var_fail:
   sec
   rts
@@ -4686,61 +4887,101 @@ zm_decode_var_operands_2b:
   bcs zm_decode_var_fail
   sta z_tmp2
 
-  ; first type byte (4 slots)
-  lda z_tmp
-  and #$C0
-  jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp
-  asl z_tmp
+  ; first type byte (4 slots): z_tmp is shift register.
+  ; Decode calls clobber z_tmp2, so save it on stack now.
+  pha               ; save z_tmp2 across z_tmp slots
 
   lda z_tmp
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp
-  asl z_tmp
+  bcs zm_decode_var_fail_pull2
+  pla
+  asl
+  asl
+  sta z_tmp
 
   lda z_tmp
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp
-  asl z_tmp
+  bcs zm_decode_var_fail_pull2
+  pla
+  asl
+  asl
+  sta z_tmp
 
   lda z_tmp
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
+  bcs zm_decode_var_fail_pull2
+  pla
+  asl
+  asl
+  sta z_tmp
 
-  ; second type byte (4 slots)
-  lda z_tmp2
+  lda z_tmp
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp2
-  asl z_tmp2
+  bcs zm_decode_var_fail_pull2
+  pla               ; discard z_tmp (done with first type byte)
+  pla               ; restore z_tmp2 (second type byte)
+  sta z_tmp2
+
+  ; second type byte (4 slots): z_tmp2 is shift register.
+  ; Decode calls clobber z_tmp2, so save/restore via pha/pla.
+  ; On error: branch forward to zm_decode_var_fail_pull_2b (1 pla + fail).
+  lda z_tmp2
+  pha
+  and #$C0
+  jsr zm_decode_one_typed_operand
+  bcs zm_decode_var_fail_pull_2b
+  pla
+  asl
+  asl
+  sta z_tmp2
 
   lda z_tmp2
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp2
-  asl z_tmp2
+  bcs zm_decode_var_fail_pull_2b
+  pla
+  asl
+  asl
+  sta z_tmp2
 
   lda z_tmp2
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
-  asl z_tmp2
-  asl z_tmp2
+  bcs zm_decode_var_fail_pull_2b
+  pla
+  asl
+  asl
+  sta z_tmp2
 
   lda z_tmp2
+  pha
   and #$C0
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail
+  bcs zm_decode_var_fail_pull_2b
+  pla               ; discard (done with second type byte)
 
   clc
+  rts
+
+zm_decode_var_fail_pull_2b:
+  pla               ; z_tmp2 (shift register push)
+  sec
+  rts
+
+zm_decode_var_fail_pull2:
+  pla               ; z_tmp (inner push)
+  pla               ; z_tmp2 (outer push)
+  sec
   rts
 
 ; Input A = top two type bits (00 large, 01 small, 10 var, 11 omitted)
@@ -5055,9 +5296,18 @@ z_emit_a2:
   lda z_idx
   sec
   sbc #6
-  beq z_begin_escape
+  beq z_begin_escape   ; z-char 6: start 10-bit ZSCII escape
+  cmp #1
+  bne z_emit_a2_table  ; z-char 7: newline
+  jsr newline
+  lda #0
+  sta z_zs_shift
+  clc
+  rts
+z_emit_a2_table:
+  ; A = z_idx - 6 (>= 2 for z-chars 8..31); subtract 2 more -> index 0..23
   sec
-  sbc #1
+  sbc #2
   tax
   lda z_a2_table, x
   jsr print_char
@@ -5106,10 +5356,12 @@ z_expand_abbrev:
   jmp z_decode_fail
 :
 
-  ; Save current decode pointer.
+  ; Save current decode pointer and shift state.
   lda z_zs_ptr
   pha
   lda z_zs_ptr+1
+  pha
+  lda z_zs_shift       ; save shift state (abbrev padding leaves z_zs_shift=2)
   pha
 
   ; packed -> byte address (v3): addr = packed * 2
@@ -5125,6 +5377,8 @@ z_expand_abbrev:
   bcs z_expand_restore_fail
 
 z_expand_restore:
+  pla                  ; restore z_zs_shift (pushed last)
+  sta z_zs_shift
   pla
   sta z_zs_ptr+1
   pla
@@ -5202,7 +5456,9 @@ msg_select:
 msg_bad_index:
   .asciiz "Invalid menu index"
 msg_selected:
-  .asciiz "Selected: "
+  .asciiz "Loading: "
+msg_ellipsis:
+  .asciiz "..."
 msg_no_story:
   .asciiz "No story selected"
 msg_open_fail:

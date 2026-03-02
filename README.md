@@ -13,7 +13,7 @@ Build a practical Z-machine implementation for KIM-1-class hardware, in staged m
 This repository is currently early/in-progress:
 
 - SD + FAT32 support libraries from the Adventure project are integrated.
-- A file loader program is implemented in `src/loadfile.s`.
+- Loader functionality is maintained in `sdcard6502/src/loadfile.s` (upstream shared source).
 - `src/zmachine.s` now includes:
   - SD/FAT32 initialization
   - playable file menu scan (`.Z1/.Z2/.Z3/.Z4/.Z5/.Z8/.DAT`)
@@ -37,11 +37,11 @@ This repository is currently early/in-progress:
 
 - `src/Makefile` - build rules
 - `src/zmachine.s` - main bring-up target: menu/select/boot + VM scaffold
-- `src/loadfile.s` - interactive loader (SD/FAT32 init, prompt, file load-to-memory)
-- `src/libsd.s` - low-level SD card SPI routines
-- `src/libfat32.s` - FAT32 directory/file routines
-- `src/libio.s` - simple console I/O helpers
-- `src/hwconfig.s` - KIM-1/VIA addresses and hardware constants
+- `sdcard6502/src/loadfile.s` - interactive loader (SD/FAT32 init, prompt, file load-to-memory)
+- `sdcard6502/src/libsd.s` - low-level SD card SPI routines (shared source)
+- `sdcard6502/src/libfat32.s` - FAT32 directory/file routines (shared source)
+- `sdcard6502/src/libio.s` - simple console I/O helpers (shared source)
+- `sdcard6502/src/hwconfig.s` - KIM-1/VIA addresses and hardware constants (shared source)
 
 ## Prerequisites
 
@@ -69,7 +69,7 @@ Clean build outputs:
 make clean
 ```
 
-## Current Loader Flow (from `loadfile.s`)
+## Current Loader Flow (from `sdcard6502/src/loadfile.s`)
 
 Once loaded/executed on the KIM-1, the loader:
 
@@ -113,6 +113,6 @@ Important current limitation: only a subset of instruction forms/opcodes are imp
 ## Notes
 
 - The active Makefile target is `zmachine.s`.
-- To build/test the loader directly, use `PROGRAM=loadfile` when invoking `make`.
-- SD wiring assumptions are defined in `src/hwconfig.s` (`SD_CS`, `SD_SCK`, `SD_MOSI`, `SD_MISO` on VIA Port A bits).
+- Loader builds/tests should be run from `sdcard6502/src`.
+- SD wiring assumptions are defined in `sdcard6502/src/hwconfig.s` (`SD_CS`, `SD_SCK`, `SD_MOSI`, `SD_MISO` on VIA Port A bits).
 - Z-machine execution is still under active development; full gameplay compatibility is not yet implemented.

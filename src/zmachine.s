@@ -1706,26 +1706,33 @@ z_return_word:
   rts
 
 ; Read big-endian word at AX into A=low, X=high.
+; z_mem_read_byte_ax sets z_tmp=addr_lo, z_tmp2=addr_hi at entry,
+; and for dynamic reads clobbers z_work_ptr (sets it to z_dynamic_base+addr).
+; We reconstruct original+1 from z_tmp/z_tmp2 to avoid this corruption.
 z_mem_read_word_ax:
   sta z_work_ptr
   stx z_work_ptr+1
   lda z_work_ptr
   ldx z_work_ptr+1
-  jsr z_mem_read_byte_ax
+  jsr z_mem_read_byte_ax        ; hi byte -> A; sets z_tmp=addr_lo, z_tmp2=addr_hi
   bcs z_mem_read_word_fail
-  pha                    ; save hi byte on stack (second jsr clobbers z_tmp)
-  inc z_work_ptr
-  bne :+
-  inc z_work_ptr+1
-:
+  pha                            ; save hi byte (second jsr clobbers z_tmp)
+  ; Compute original+1 from z_tmp/z_tmp2 (safe across both static and dynamic reads)
+  clc
+  lda z_tmp                      ; original addr lo
+  adc #1
+  sta z_work_ptr
+  lda z_tmp2                     ; original addr hi
+  adc #0
+  sta z_work_ptr+1
   lda z_work_ptr
   ldx z_work_ptr+1
-  jsr z_mem_read_byte_ax   ; lo byte -> A
+  jsr z_mem_read_byte_ax         ; lo byte -> A
   bcs z_mem_read_word_fail_pull
-  sta z_tmp              ; save lo byte
-  pla                    ; hi byte -> A
-  tax                    ; hi -> X
-  lda z_tmp              ; lo -> A
+  sta z_tmp                      ; save lo byte
+  pla                            ; hi byte -> A
+  tax                            ; hi -> X
+  lda z_tmp                      ; lo -> A
   clc
   rts
 
@@ -2505,7 +2512,7 @@ z_long_op2_var:
 
 z_long_dispatch:
   lda z_opcode
-  and #$1F
+  and #$1F            ; long form: opcode is bits 4-0 (bit6=op1 type, bit5=op2 type)
   cmp #$01            ; je
   bne :+
   jmp op_2op_je
@@ -2517,6 +2524,14 @@ z_long_dispatch:
   cmp #$03            ; jg
   bne :+
   jmp op_2op_jg
+:
+  cmp #$04            ; dec_chk
+  bne :+
+  jmp op_2op_dec_chk
+:
+  cmp #$05            ; inc_chk
+  bne :+
+  jmp op_2op_inc_chk
 :
   cmp #$06            ; jin
   bne :+
@@ -5505,7 +5520,7 @@ z_bit_mask:
 ;------------------------------------------------------------
 ; Includes
 ;------------------------------------------------------------
-  .include "hwconfig.s"
-  .include "libsd.s"
-  .include "libfat32.s"
-  .include "libio.s"
+  .include "../sdcard6502/src/hwconfig.s"
+  .include "../sdcard6502/src/libsd.s"
+  .include "../sdcard6502/src/libfat32.s"
+  .include "../sdcard6502/src/libio.s"

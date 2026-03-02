@@ -59,39 +59,28 @@ fat32_init:
   ; Check some things
   lda fat32_readbuffer+510 ; Boot sector signature 55
   cmp #$55
-  bne _fail
+  beq :+
+  jmp _error
+:
   lda fat32_readbuffer+511 ; Boot sector signature aa
   cmp #$aa
-  bne _fail
+  beq :+
+  jmp _error
+:
 
 
   inc fat32_errorstage ; stage 2 = finding partition
 
-  ; Find a FAT32 LBA partition, type 12 (0xc)
-_FSTYPE_FAT32 = 12
+  ; Find a valid FAT32 partition entry (type 0x0B or 0x0C).
+  ; If none validate, fall back to superfloppy BPB at sector 0.
   ldx #0
+_find_part_loop:
   lda fat32_readbuffer+$1c2,x
-  cmp #_FSTYPE_FAT32
-  beq _foundpart
-  ldx #16
-  lda fat32_readbuffer+$1c2,x
-  cmp #_FSTYPE_FAT32
-  beq _foundpart
-  ldx #32
-  lda fat32_readbuffer+$1c2,x
-  cmp #_FSTYPE_FAT32
-  beq _foundpart
-  ldx #48
-  lda fat32_readbuffer+$1c2,x
-  cmp #_FSTYPE_FAT32
-  beq _foundpart
-
-_fail:
-  jmp _error
-
-_foundpart:
-
-  ; Read the FAT32 BPB
+  cmp #$0c
+  beq _try_part_bpb
+  cmp #$0b
+  bne _next_part
+_try_part_bpb:
   lda fat32_readbuffer+$1c6,x
   sta zp_sd_currentsector
   lda fat32_readbuffer+$1c7,x
@@ -100,40 +89,34 @@ _foundpart:
   sta zp_sd_currentsector+2
   lda fat32_readbuffer+$1c9,x
   sta zp_sd_currentsector+3
-
   jsr sd_readsector
+  jsr fat32_validate_bpb
+  bcc _have_valid_bpb
+_next_part:
+  txa
+  clc
+  adc #16
+  tax
+  cpx #64
+  bcc _find_part_loop
 
+  ; Superfloppy fallback: BPB in sector 0
+  lda #0
+  sta zp_sd_currentsector
+  sta zp_sd_currentsector+1
+  sta zp_sd_currentsector+2
+  sta zp_sd_currentsector+3
+  jsr sd_readsector
+  jsr fat32_validate_bpb
+  bcc :+
+  jmp _error
+:
 
+_have_valid_bpb:
   inc fat32_errorstage ; stage 3 = BPB signature check
-
-  ; Check some things
-  lda fat32_readbuffer+510 ; BPB sector signature 55
-  cmp #$55
-  bne _fail
-  lda fat32_readbuffer+511 ; BPB sector signature aa
-  cmp #$aa
-  bne _fail
-
   inc fat32_errorstage ; stage 4 = RootEntCnt check
-
-  lda fat32_readbuffer+17 ; RootEntCnt should be 0 for FAT32
-  ora fat32_readbuffer+18
-  bne _fail
-
   inc fat32_errorstage ; stage 5 = TotSec16 check
-
-  lda fat32_readbuffer+19 ; TotSec16 should be 0 for FAT32
-  ora fat32_readbuffer+20
-  bne _fail
-
   inc fat32_errorstage ; stage 6 = SectorsPerCluster check
-
-  ; Check bytes per filesystem sector, it should be 512 for any SD card that supports FAT32
-  lda fat32_readbuffer+11 ; low byte should be zero
-  bne _fail
-  lda fat32_readbuffer+12 ; high byte is 2 (512), 4, 8, or 16
-  cmp #2
-  bne _fail
 
   ; Calculate the starting sector of the FAT
   clc
@@ -215,6 +198,134 @@ _skipfatsloop:
   sta fat32_lastsector+2
   sta fat32_lastsector+3
 
+  clc
+  rts
+
+_fail:
+  jmp _error
+
+fat32_validate_bpb:
+  ; Validate FAT32 BPB currently loaded in fat32_readbuffer.
+  ; C clear = valid, C set = invalid.
+
+  lda fat32_readbuffer+510
+  cmp #$55
+  beq :+
+  jmp _bpb_invalid
+:
+  lda fat32_readbuffer+511
+  cmp #$aa
+  beq :+
+  jmp _bpb_invalid
+:
+
+  lda fat32_readbuffer+17
+  ora fat32_readbuffer+18
+  beq :+
+  jmp _bpb_invalid
+:
+
+  lda fat32_readbuffer+19
+  ora fat32_readbuffer+20
+  beq :+
+  jmp _bpb_invalid
+:
+
+  lda fat32_readbuffer+11
+  beq :+
+  jmp _bpb_invalid
+:
+  lda fat32_readbuffer+12
+  cmp #2
+  beq :+
+  jmp _bpb_invalid
+:
+
+  ; FAT count must be at least 1.
+  lda fat32_readbuffer+16
+  bne :+
+  jmp _bpb_invalid
+:
+
+  ; Reserved sectors must be nonzero.
+  lda fat32_readbuffer+14
+  ora fat32_readbuffer+15
+  bne :+
+  jmp _bpb_invalid
+:
+
+  ; FAT size (FATSz32) must be nonzero.
+  lda fat32_readbuffer+36
+  ora fat32_readbuffer+37
+  ora fat32_readbuffer+38
+  ora fat32_readbuffer+39
+  bne :+
+  jmp _bpb_invalid
+:
+
+  ; Root cluster must be >= 2.
+  lda fat32_readbuffer+47
+  bne :+
+  lda fat32_readbuffer+46
+  bne :+
+  lda fat32_readbuffer+45
+  bne :+
+  lda fat32_readbuffer+44
+  cmp #2
+  bcs :+
+  jmp _bpb_invalid
+:
+
+  ; Filesystem type marker should read "FAT32".
+  lda fat32_readbuffer+82
+  cmp #'F'
+  beq :+
+  jmp _bpb_invalid
+:
+  lda fat32_readbuffer+83
+  cmp #'A'
+  beq :+
+  jmp _bpb_invalid
+:
+  lda fat32_readbuffer+84
+  cmp #'T'
+  beq :+
+  jmp _bpb_invalid
+:
+  lda fat32_readbuffer+85
+  cmp #'3'
+  beq :+
+  jmp _bpb_invalid
+:
+  lda fat32_readbuffer+86
+  cmp #'2'
+  beq :+
+  jmp _bpb_invalid
+:
+
+  ; Sectors/cluster must be one of 1,2,4,8,16,32,64,128.
+  lda fat32_readbuffer+13
+  cmp #1
+  beq _bpb_valid
+  cmp #2
+  beq _bpb_valid
+  cmp #4
+  beq _bpb_valid
+  cmp #8
+  beq _bpb_valid
+  cmp #16
+  beq _bpb_valid
+  cmp #32
+  beq _bpb_valid
+  cmp #64
+  beq _bpb_valid
+  cmp #128
+  beq _bpb_valid
+
+_bpb_invalid:
+  sec
+  rts
+_bpb_valid:
   clc
   rts
 
@@ -1064,10 +1175,14 @@ _fseek:
   clc
   jsr fat32_seekcluster
 
-  ; Force the first file sector read to cross the buffer boundary cleanly.
-  lda #<(fat32_readbuffer+$1e0)
+  ; Force the first file sector read to load a new sector immediately.
+  ; $1e0 works for directory reads (fat32_readdirent advances 32 bytes),
+  ; but file reads advance 1 byte at a time, so we must start at $200
+  ; (past buffer end) so fat32_file_readbyte triggers a sector load on
+  ; the very first call.
+  lda #<(fat32_readbuffer+$200)
   sta zp_sd_address
-  lda #>(fat32_readbuffer+$1e0)
+  lda #>(fat32_readbuffer+$200)
   sta zp_sd_address+1
 
   rts

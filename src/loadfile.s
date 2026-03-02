@@ -7,7 +7,7 @@ input_pointer = $2B          ; 11 bytes
 print_pointer = $38          ; 2 bytes
 zp_sd_address = $40          ; 2 bytes
 zp_sd_currentsector = $42    ; 4 bytes
-zp_fat32_variables = $46     ; 49 bytes
+zp_fat32_variables = $B0     ; 49 bytes
 copy_swap = $7A              ; 4 bytes
 menu_count = $7E             ; 1 byte
 menu_scan_guard = $7F        ; 1 byte
@@ -63,6 +63,16 @@ read_prompt_input:
   bne print_prompt
   jsr EXIT
 menu_files:
+  jsr via_init
+  jsr sd_init
+  jsr fat32_init
+  bcc :+
+  lda #'Z'
+  jsr print_char
+  lda fat32_errorstage
+  jsr print_hex
+  jmp print_prompt
+:
   jsr list_files
   jmp print_prompt
 ;----------------------------------------------
@@ -76,6 +86,16 @@ load_file:
   sty print_pointer+1
   jsr print_string
   jsr read_input
+  jsr via_init
+  jsr sd_init
+  jsr fat32_init
+  bcc :+
+  lda #'Z'
+  jsr print_char
+  lda fat32_errorstage
+  jsr print_hex
+  jmp print_prompt
+:
   ; Find file by name
   ldx #<input_pointer
   ldy #>input_pointer
@@ -103,30 +123,57 @@ foundfile:
   jsr newline
   ; Open file
   jsr fat32_opendirent
-  ; Store file size
-  lda fat32_bytesremaining 
+  ; Reject files larger than 64K.
+  lda fat32_bytesremaining+2
+  ora fat32_bytesremaining+3
+  beq file_size_ok
+  ldx #<file_too_large
+  ldy #>file_too_large
+  stx print_pointer
+  sty print_pointer+1
+  jsr print_string
+  jsr fat32_openroot
+  jmp print_prompt
+file_size_ok:
+  ; Destination must be in application RAM ($2000-$9FFF).
+  lda copy_destination+1
+  cmp #$20
+  bcc destination_invalid
+  cmp #$A0
+  bcs destination_invalid
+  ; Ensure file fits inside app RAM end at $9FFF.
+  sec
+  lda #$00
+  sbc copy_destination
   sta copy_size
-  lda fat32_bytesremaining+1
+  lda #$A0
+  sbc copy_destination+1
   sta copy_size+1
-  ; Read file contents into buffer
-  lda #<buffer
-  sta fat32_address
-  lda #>buffer
-  sta fat32_address+1
+  lda <fat32_bytesremaining+1
+  cmp copy_size+1
+  bcc destination_ok
+  bne destination_invalid
+  lda fat32_bytesremaining
+  cmp copy_size
+  bcc destination_ok
+  beq destination_ok
+destination_invalid:
+  ldx #<destination_out_of_range
+  ldy #>destination_out_of_range
+  stx print_pointer
+  sty print_pointer+1
+  jsr print_string
+  jsr fat32_openroot
+  jmp print_prompt
+destination_ok:
   ldx #<reading
   ldy #>reading
   stx print_pointer
   sty print_pointer+1
   jsr print_string
-  ; Can hang on the file read sometimes
-  jsr fat32_file_read
-  ldx #<copying
-  ldy #>copying
-  stx print_pointer
-  sty print_pointer+1
-  jsr print_string
-  ; Start copy
-  jsr start_copy
+  ; Stream file bytes to destination.
+  jsr stream_copy_file
+  jsr fat32_openroot
   ; Return to prompt
   jmp print_prompt
 ;----------------------------------------------
@@ -178,18 +225,15 @@ read_address_next:
   cpx #2
   beq read_address_done
   jsr get_key                ; read first digit of hex address,
-  and #$0F                   ; '0'-'9' -> 0-9
-  asl                        ; multiply by 2
-  sta copy_destination, x    ; temp store in temp
-  asl                        ; again multiply by 2 (*4)
-  asl                        ; again multiply by 2 (*8)
-  clc
-  adc copy_destination, x    ; as result, a = x*8 + x*2
+  jsr hex_char_to_nibble
+  asl
+  asl
+  asl
+  asl
   sta copy_destination, x
   jsr get_key                ; read second digit of hex address
-  and #$0F                   ; '0'-'9' -> 0-9
-  adc copy_destination, x
-  jsr hex_to_dec
+  jsr hex_char_to_nibble
+  ora copy_destination, x
   sta copy_destination, x
   inx
   jmp read_address_next
@@ -226,44 +270,59 @@ get_key:
 list_files:
   lda #0
   sta menu_count
-  sta menu_scan_guard
+  lda #<buffer
+  sta copy_swap
+  lda #>buffer
+  sta copy_swap+1
   jsr fat32_openroot
+list_files_entry_next:
+  jsr fat32_readdirent
+  bcs list_files_print
+  and #$18
+  bne list_files_entry_next
+  jsr is_playable_file
+  bcc list_files_entry_next
+  jsr append_menu_entry
+  lda menu_count
+  cmp #16
+  bcs list_files_print
+  jmp list_files_entry_next
+list_files_print:
   jsr newline
   ldx #<available_files
   ldy #>available_files
   stx print_pointer
   sty print_pointer+1
   jsr print_string
-list_files_scan_next:
-  inc menu_scan_guard
-  lda menu_scan_guard
-  beq list_files_done         ; stop after 256 scanned entries
-  jsr fat32_readdirent
-  bcs list_files_done
-  and #$18                    ; skip directories and volume labels
-  bne list_files_scan_next
-  jsr has_valid_base_name
-  bcc list_files_scan_next
-  jsr is_playable_file
-  bcc list_files_scan_next
-  jsr newline
-  lda #' '
-  jsr print_char
-  lda #' '
-  jsr print_char
-  jsr print_dirent_name
-  inc menu_count
   lda menu_count
-  cmp #16                     ; cap printed entries
-  bcc list_files_scan_next
+  sta copy_size
+  lda menu_count
+  beq list_files_done
+  lda #<buffer
+  sta copy_swap
+  lda #>buffer
+  sta copy_swap+1
+list_files_print_next:
+  lda menu_count
+  beq list_files_done
+  jsr cache_dirent_name
   jsr newline
-  ldx #<files_truncated
-  ldy #>files_truncated
-  stx print_pointer
-  sty print_pointer+1
-  jsr print_string
+  lda #' '
+  jsr print_char
+  lda #' '
+  jsr print_char
+  jsr print_cached_name
+  clc
+  lda copy_swap
+  adc #12
+  sta copy_swap
+  bcc :+
+  inc copy_swap+1
+:
+  dec menu_count
+  jmp list_files_print_next
 list_files_done:
-  lda menu_count
+  lda copy_size
   bne list_files_restore_root
   jsr newline
   ldx #<no_playable_files
@@ -275,42 +334,76 @@ list_files_restore_root:
   jsr fat32_openroot
   rts
 ;----------------------------------------------
-; Print current dirent as NAME.EXT
+; Append current dirent 8.3 into menu cache at copy_swap
 ;----------------------------------------------
-print_dirent_name:
+append_menu_entry:
+  ldy #0
+append_menu_entry_loop:
+  cpy #11
+  beq append_menu_entry_end
+  lda (zp_sd_address), y
+  sta (copy_swap), y
+  iny
+  jmp append_menu_entry_loop
+append_menu_entry_end:
+  lda #0
+  sta (copy_swap), y
+  clc
+  lda copy_swap
+  adc #12
+  sta copy_swap
+  bcc :+
+  inc copy_swap+1
+:
+  inc menu_count
+  rts
+;----------------------------------------------
+; Copy current dirent 8.3 name into input_pointer[0..10]
+;----------------------------------------------
+cache_dirent_name:
   ldx #0
-print_dirent_base_loop:
-  cpx #8
-  beq print_dirent_maybe_ext
+cache_dirent_name_loop:
+  cpx #11
+  beq cache_dirent_name_done
   txa
   tay
-  lda (zp_sd_address), y
+  lda (copy_swap), y
+  sta buffer, x
+  inx
+  jmp cache_dirent_name_loop
+cache_dirent_name_done:
+  rts
+;----------------------------------------------
+; Print cached 8.3 name from input_pointer as NAME.EXT
+;----------------------------------------------
+print_cached_name:
+  ldx #0
+print_cached_base_loop:
+  cpx #8
+  beq print_cached_maybe_ext
+  lda buffer, x
   cmp #' '
-  beq print_dirent_maybe_ext
+  beq print_cached_maybe_ext
   jsr print_char
   inx
-  jmp print_dirent_base_loop
-print_dirent_maybe_ext:
+  jmp print_cached_base_loop
+print_cached_maybe_ext:
   ldx #8
-  txa
-  tay
-  lda (zp_sd_address), y
+  lda buffer, x
   cmp #' '
-  beq print_dirent_done
+  beq print_cached_done
   lda #'.'
   jsr print_char
-print_dirent_ext_loop:
+print_cached_ext_loop:
   cpx #11
-  beq print_dirent_done
-  txa
-  tay
-  lda (zp_sd_address), y
+  beq print_cached_done
+  lda buffer, x
   cmp #' '
-  beq print_dirent_done
+  beq print_cached_done
   jsr print_char
   inx
-  jmp print_dirent_ext_loop
-print_dirent_done:
+  jmp print_cached_ext_loop
+print_cached_done:
   rts
 ;----------------------------------------------
 ; Return C=1 if dirent extension is playable
@@ -319,16 +412,19 @@ print_dirent_done:
 is_playable_file:
   ldy #8
   lda (zp_sd_address), y
+  and #$DF
   cmp #'Z'
   beq is_playable_z
   cmp #'D'
   bne is_playable_no
   iny
   lda (zp_sd_address), y
+  and #$DF
   cmp #'A'
   bne is_playable_no
   iny
   lda (zp_sd_address), y
+  and #$DF
   cmp #'T'
   bne is_playable_no
   sec
@@ -349,10 +445,6 @@ is_playable_z:
   cmp #'8'
   bne is_playable_no
 is_playable_z_ok:
-  iny
-  lda (zp_sd_address), y
-  cmp #' '
-  bne is_playable_no
   sec
   rts
 is_playable_no:
@@ -393,48 +485,56 @@ has_valid_base_name_no:
 has_valid_base_name_yes:
   sec
   rts
-; Hex to decimal converter
 ;----------------------------------------------
-hex_to_dec:
-  sed                        ; switch to decimal mode
-  tay                        ; transfer accumulator to y register
-  lda #00                    ; reset accumulator
-hex_loop:
-  dey                        ; decrement x by 1
-  cpy #00                    ; if y < 0,
-  bmi hex_break              ; then break;
-  clc                        ; else clear carry
-  adc #01                    ; to increment accumulator by 1
-  jmp hex_loop               ; branch always
-hex_break:
-  cld
-  rts                        ; return from subroutine
+; Convert ASCII hex char in A to nibble in A.
+; Invalid chars map to 0.
+;----------------------------------------------
+hex_char_to_nibble:
+  cmp #'0'
+  bcc hex_char_invalid
+  cmp #'9'+1
+  bcc hex_char_digit
+  cmp #'A'
+  bcc hex_char_check_lower
+  cmp #'F'+1
+  bcc hex_char_upper
+hex_char_check_lower:
+  cmp #'a'
+  bcc hex_char_invalid
+  cmp #'f'+1
+  bcs hex_char_invalid
+  sec
+  sbc #'a'-10
+  rts
+hex_char_upper:
+  sec
+  sbc #'A'-10
+  rts
+hex_char_digit:
+  sec
+  sbc #'0'
+  rts
+hex_char_invalid:
+  lda #0
+  rts
 ;----------------------------------------------
 ; Relocate code
 ;----------------------------------------------
-start_copy:
-  lda #<buffer               ; set our source memory address to copy from
-  sta copy_swap
-  lda #>buffer
-  sta copy_swap+1
-  lda copy_destination+1     ; set our destination memory to copy to
+stream_copy_file:
+  lda copy_destination       ; set destination pointer
   sta copy_swap+2
-  lda copy_destination
+  lda copy_destination+1
   sta copy_swap+3
-  ldx #$00                   ; reset x for our loop
-  ldy #$00                   ; reset y for our loop
-copy_loop:
-  lda (copy_swap),y          ; indirect index source memory address
-  sta (copy_swap+2),y        ; indirect index dest memory address
-  iny
-  bne copy_loop              ; loop until our dest goes over 255
-  inc copy_swap+1            ; increment high order source memory address
-  inc copy_swap+3            ; increment high order dest memory address
-  cpx copy_size+1            ; compare with the last address we want to write
-  beq stop_copy
-  inx
-  jmp copy_loop              ; if we're not there yet, loop
-stop_copy:
+stream_copy_loop:
+  jsr fat32_file_readbyte
+  bcs stream_copy_done
+  ldy #0
+  sta (copy_swap+2), y
+  inc copy_swap+2
+  bne stream_copy_loop
+  inc copy_swap+3
+  jmp stream_copy_loop
+stream_copy_done:
   rts
 ;----------------------------------------------
 ; Strings
@@ -460,9 +560,11 @@ file_not_found:
 memory_destination:
   .asciiz "Memory destination > "
 reading:
-  .asciiz "Reading data from SD card"
-copying:
-  .asciiz "Copying data to destination"
+  .asciiz "Reading/copying data from SD card"
+destination_out_of_range:
+  .asciiz "Destination/file outside app RAM 2000-9FFF"
+file_too_large:
+  .asciiz "File too large (>64K)"
 ;----------------------------------------------
 ; Includes
 ;----------------------------------------------

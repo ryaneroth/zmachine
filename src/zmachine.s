@@ -96,13 +96,14 @@ menu_cluster_table   = $0500 ; 16 entries * 4-byte start cluster
 subdir_cluster_table = $0540 ; 8 entries * 4-byte start cluster
 fake_dirent          = $0560 ; synthetic 32-byte dirent for cluster-open
 story_name           = $0580 ; 12-byte 8.3 name buffer (must be RAM, not ROM)
-z_dynamic_base       = $5000 ; dynamic story bytes (0 .. static_base-1)
-z_eval_stack_base    = $7000 ; eval stack
-z_call_stack_base    = $7800 ; call frame stack
+z_dynamic_base       = $2000 ; dynamic story bytes (0 .. static_base-1)
+z_eval_stack_base    = $8000 ; eval stack
+z_call_stack_base    = $8800 ; call frame stack
 
 .org $A000
 
 reset:
+  cld
   ldx #$FF
   txs
 
@@ -710,6 +711,12 @@ story_rewind_open:
   lda (zp_sd_address),y
   sta z_story_filesize+3
   jsr fat32_opendirent
+  ; libfat32 leaves zp_sd_address at readbuffer+$1E0 after open.
+  ; Force first story byte read to trigger a sector fetch.
+  lda #<(fat32_readbuffer+$200)
+  sta zp_sd_address
+  lda #>(fat32_readbuffer+$200)
+  sta zp_sd_address+1
   lda #0
   sta z_story_pos
   sta z_story_pos+1
@@ -917,7 +924,7 @@ story_read_word_at_target:
   rts
 
 ; Seek the story stream to exactly z_story_target (24-bit byte offset).
-; Three tiers:
+; Fast path:
 ;   A) Already positioned (target == pos): instant return.
 ;   B) Same sector (target >> 9 == pos >> 9): reposition zp_sd_address only.
 ;   C) Next sequential sector: one fat32_readnextsector call.
@@ -941,8 +948,6 @@ story_seek_to_target:
 seek_check_sector:
   ; ------------------------------------------------------------------
   ; Compute target_sector = z_story_target >> 9 into z_seek_tsec.
-  ; (Uses dedicated scratch to avoid clobbering z_tmp/z_tmp2/z_work_ptr
-  ;  which callers may hold live across story_read_byte_at_target calls.)
   ; ------------------------------------------------------------------
   lda z_story_target+2
   lsr
@@ -962,7 +967,7 @@ seek_check_sector:
   sta z_seek_csec_lo
 
   ; ------------------------------------------------------------------
-  ; Tier B: same sector — reposition zp_sd_address within the buffer.
+  ; Tier B: same sector, reposition zp_sd_address within the buffer.
   ; ------------------------------------------------------------------
   lda z_seek_tsec_lo
   cmp z_seek_csec_lo
@@ -970,7 +975,6 @@ seek_check_sector:
   lda z_seek_tsec_hi
   cmp z_seek_csec_hi
   bne seek_check_next
-  ; Same sector: just point into the already-loaded buffer.
   lda z_story_target
   sta zp_sd_address
   lda z_story_target+1
@@ -980,7 +984,7 @@ seek_check_sector:
   jmp seek_update_pos
 
   ; ------------------------------------------------------------------
-  ; Tier C: next sequential sector — one fat32_readnextsector call.
+  ; Tier C: next sequential sector, one fat32_readnextsector call.
   ; ------------------------------------------------------------------
 seek_check_next:
   clc
@@ -992,7 +996,6 @@ seek_check_next:
   adc #0
   cmp z_seek_tsec_hi
   bne seek_full
-  ; Target is exactly one sector ahead.
   lda #<fat32_readbuffer
   sta fat32_address
   lda #>fat32_readbuffer
@@ -1010,7 +1013,7 @@ seek_check_next:
   jmp seek_update_pos
 
   ; ------------------------------------------------------------------
-  ; Tier D: arbitrary seek — walk FAT chain from file start.
+  ; Tier D: arbitrary seek, walk FAT chain from file start.
   ; ------------------------------------------------------------------
 seek_full:
   lda z_story_startcluster
@@ -1391,6 +1394,7 @@ z_set_global_word:
 
 z_get_local_word:
   ; var id in A (1..15)
+  sta z_tmp2
   lda z_fp
   ora z_fp+1
   bne :+
@@ -1398,6 +1402,7 @@ z_get_local_word:
   tax
   rts
 :
+  lda z_tmp2
   sec
   sbc #1
   asl
@@ -1577,7 +1582,7 @@ z_call_default_loop:
   inc z_work_ptr+1
 :
   ; Store A=lo, X=hi into frame slot [6 + z_idx*2].
-  ; Save lo (A) on stack while computing Y offset — tya/asl would clobber A.
+  ; Save lo (A) on stack while computing Y offset ??? tya/asl would clobber A.
   pha
   lda z_idx
   asl
@@ -2255,17 +2260,17 @@ z_obj_attr_write_done:
 ;------------------------------------------------------------
 run_vm:
   lda z_story_booted
-  bne :+
+  bne run_vm_after_boot
   jsr boot_story
-  bcs run_vm_done
-:
+  bcc run_vm_after_boot
+  jmp run_vm_done
+run_vm_after_boot:
   jsr newline
   ldx #<msg_vm_run
   ldy #>msg_vm_run
   stx z_print_ptr
   sty z_print_ptr+1
   jsr print_string
-
 vm_loop:
   jsr zm_step
   bcs run_vm_done
@@ -2355,7 +2360,7 @@ zm_step:
   jmp zm_handle_short_1op
 :
 
-  ; 0OP / VAR form subset — reload opcode (A was contaminated by and #$C0 above)
+  ; 0OP / VAR form subset ??? reload opcode (A was contaminated by and #$C0 above)
   lda z_opcode
   cmp #$B0            ; rtrue
   bne :+
@@ -2609,6 +2614,18 @@ z_long_dispatch:
   bne :+
   jmp op_2op_mod
 :
+  cmp #$19            ; call_2s
+  bne :+
+  jmp op_2op_call_2s
+:
+  cmp #$1A            ; call_2n
+  bne :+
+  jmp op_2op_call_2n
+:
+  cmp #$1D            ; undefined in standard (compat: treat as nop)
+  bne :+
+  jmp op_2op_compat_nop
+:
   jmp zm_unknown_opcode
 
 ; Handle variable-form 2OP opcodes (C0..DF) with type byte.
@@ -2729,6 +2746,10 @@ zm_handle_var_2op:
   bne :+
   jmp op_2op_call_2n
 :
+  cmp #$1D            ; undefined in standard (compat: treat as nop)
+  bne :+
+  jmp op_2op_compat_nop
+:
   jmp zm_unknown_opcode
 
 op_2op_je:
@@ -2777,15 +2798,16 @@ op_2op_jl:
   lda z_op2_hi
   eor #$80
   cmp z_tmp
-  bcc :+
-  bne :++
+  bcc op_2op_jl_false
+  bne op_2op_jl_true
   lda z_op1_lo
   cmp z_op2_lo
-  bcc :+
-: lda #1
-  jmp z_branch_on_bool
-:
+  bcc op_2op_jl_true
+op_2op_jl_false:
   lda #0
+  jmp z_branch_on_bool
+op_2op_jl_true:
+  lda #1
   jmp z_branch_on_bool
 
 op_2op_jg:
@@ -2796,15 +2818,16 @@ op_2op_jg:
   lda z_op2_hi
   eor #$80
   cmp z_tmp
-  bcc :+
-  bne :++
+  bcc op_2op_jg_true
+  bne op_2op_jg_false
   lda z_op2_lo
   cmp z_op1_lo
-  bcc :+
-: lda #1
-  jmp z_branch_on_bool
-:
+  bcc op_2op_jg_true
+op_2op_jg_false:
   lda #0
+  jmp z_branch_on_bool
+op_2op_jg_true:
+  lda #1
   jmp z_branch_on_bool
 
 op_2op_dec_chk:
@@ -3288,6 +3311,13 @@ op_2op_call_2n:
   sta z_storevar
   jmp z_call_common
 
+; Non-standard compatibility path:
+; 2OP opcode number $1D is undefined in the spec. Some malformed story paths
+; can surface this byte; treat as a no-op so VM execution can continue.
+op_2op_compat_nop:
+  clc
+  rts
+
 ; Handle short-form 1OP instructions (type bits != 11).
 zm_handle_short_1op:
   ; Decode operand into z_op1.
@@ -3652,7 +3682,7 @@ op_1op_not:
 
 z_branch_on_bool:
   ; Input A: 0=false, nonzero=true.
-  ; Save bool on stack — z_tmp is clobbered by zm_fetch_byte via z_mem_read_byte_ax.
+  ; Save bool on stack ??? z_tmp is clobbered by zm_fetch_byte via z_mem_read_byte_ax.
   pha
   jsr zm_fetch_byte
   bcc :+
@@ -4304,6 +4334,19 @@ zm_unknown_opcode:
   jsr print_string
   lda z_opcode
   jsr print_hex
+  lda #' '
+  jsr print_char
+  sec
+  lda z_pc
+  sbc #1
+  sta z_tmp
+  lda z_pc+1
+  sbc #0
+  sta z_tmp2
+  lda z_tmp2
+  jsr print_hex
+  lda z_tmp
+  jsr print_hex
   sec
   rts
 
@@ -4396,6 +4439,16 @@ op_call_vs:
   jsr zm_fetch_byte
   bcs zm_stop
   sta z_storevar
+  lda z_opcount
+  bne :+
+  ; call with omitted routine (routine 0): store false
+  ldy z_storevar
+  lda #0
+  tax
+  jsr z_set_var_word
+  clc
+  rts
+:
   jmp z_call_common
 
 op_call_vs2:
@@ -4404,11 +4457,27 @@ op_call_vs2:
   jsr zm_fetch_byte
   bcs zm_stop
   sta z_storevar
+  lda z_opcount
+  bne :+
+  ; call with omitted routine (routine 0): store false
+  ldy z_storevar
+  lda #0
+  tax
+  jsr z_set_var_word
+  clc
+  rts
+:
   jmp z_call_common
 
 op_call_vn:
   jsr zm_decode_var_operands
   bcs zm_stop
+  lda z_opcount
+  bne :+
+  ; call with omitted routine (routine 0): no store side-effect
+  clc
+  rts
+:
   lda #$FF
   sta z_storevar
   jmp z_call_common
@@ -4416,6 +4485,12 @@ op_call_vn:
 op_call_vn2:
   jsr zm_decode_var_operands_2b
   bcs zm_stop
+  lda z_opcount
+  bne :+
+  ; call with omitted routine (routine 0): no store side-effect
+  clc
+  rts
+:
   lda #$FF
   sta z_storevar
   jmp z_call_common
@@ -4445,7 +4520,9 @@ op_storew_var:
 
 op_storeb_var:
   jsr zm_decode_var_operands
-  bcs zm_stop
+  bcc :+
+  jmp zm_stop
+:
   ; addr = op1 + op2
   clc
   lda z_op1_lo
@@ -4843,6 +4920,8 @@ zm_decode_var_operands:
   lda z_tmp
   pha               ; save type-shift register (zm_decode_one_typed_operand clobbers z_tmp)
   and #$C0
+  cmp #$C0
+  beq zm_decode_var_done_pull
   jsr zm_decode_one_typed_operand
   bcs zm_decode_var_fail_pull
   pla
@@ -4854,6 +4933,8 @@ zm_decode_var_operands:
   lda z_tmp
   pha
   and #$C0
+  cmp #$C0
+  beq zm_decode_var_done_pull
   jsr zm_decode_one_typed_operand
   bcs zm_decode_var_fail_pull
   pla
@@ -4865,6 +4946,8 @@ zm_decode_var_operands:
   lda z_tmp
   pha
   and #$C0
+  cmp #$C0
+  beq zm_decode_var_done_pull
   jsr zm_decode_one_typed_operand
   bcs zm_decode_var_fail_pull
   pla
@@ -4876,12 +4959,19 @@ zm_decode_var_operands:
   lda z_tmp
   pha
   and #$C0
+  cmp #$C0
+  beq zm_decode_var_done_pull
   jsr zm_decode_one_typed_operand
   bcs zm_decode_var_fail_pull
   pla               ; discard (done with shift register)
 
+zm_decode_var_done:
   clc
   rts
+
+zm_decode_var_done_pull:
+  pla
+  jmp zm_decode_var_done
 
 zm_decode_var_fail_pull:
   pla
@@ -4909,8 +4999,14 @@ zm_decode_var_operands_2b:
   lda z_tmp
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull2_early
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull2
+  bcc :+
+  jmp zm_decode_var_fail_pull2
+:
   pla
   asl
   asl
@@ -4919,8 +5015,14 @@ zm_decode_var_operands_2b:
   lda z_tmp
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull2_early
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull2
+  bcc :+
+  jmp zm_decode_var_fail_pull2
+:
   pla
   asl
   asl
@@ -4929,8 +5031,14 @@ zm_decode_var_operands_2b:
   lda z_tmp
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull2_early
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull2
+  bcc :+
+  jmp zm_decode_var_fail_pull2
+:
   pla
   asl
   asl
@@ -4939,8 +5047,14 @@ zm_decode_var_operands_2b:
   lda z_tmp
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull2_early
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull2
+  bcc :+
+  jmp zm_decode_var_fail_pull2
+:
   pla               ; discard z_tmp (done with first type byte)
   pla               ; restore z_tmp2 (second type byte)
   sta z_tmp2
@@ -4951,8 +5065,14 @@ zm_decode_var_operands_2b:
   lda z_tmp2
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull_2b
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull_2b
+  bcc :+
+  jmp zm_decode_var_fail_pull_2b
+:
   pla
   asl
   asl
@@ -4961,8 +5081,14 @@ zm_decode_var_operands_2b:
   lda z_tmp2
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull_2b
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull_2b
+  bcc :+
+  jmp zm_decode_var_fail_pull_2b
+:
   pla
   asl
   asl
@@ -4971,8 +5097,14 @@ zm_decode_var_operands_2b:
   lda z_tmp2
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull_2b
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull_2b
+  bcc :+
+  jmp zm_decode_var_fail_pull_2b
+:
   pla
   asl
   asl
@@ -4981,10 +5113,27 @@ zm_decode_var_operands_2b:
   lda z_tmp2
   pha
   and #$C0
+  cmp #$C0
+  bne :+
+  jmp zm_decode_var_done_pull_2b
+:
   jsr zm_decode_one_typed_operand
-  bcs zm_decode_var_fail_pull_2b
+  bcc :+
+  jmp zm_decode_var_fail_pull_2b
+:
   pla               ; discard (done with second type byte)
 
+  clc
+  rts
+
+zm_decode_var_done_pull2_early:
+  pla               ; z_tmp (inner push)
+  pla               ; z_tmp2 (outer push)
+  clc
+  rts
+
+zm_decode_var_done_pull_2b:
+  pla               ; z_tmp2 (shift register push)
   clc
   rts
 
@@ -5240,6 +5389,7 @@ z_process_no_escape:
   bcs z_decode_fail
   lda #0
   sta z_zs_abbrev
+  sta z_zs_shift
   clc
   rts
 
@@ -5262,12 +5412,16 @@ z_process_not_abbrev:
 z_emit_space:
   lda #' '
   jsr print_char
+  lda #0
+  sta z_zs_shift
   clc
   rts
 
 z_set_abbrev_prefix:
   lda z_idx
   sta z_zs_abbrev
+  lda #0
+  sta z_zs_shift
   clc
   rts
 
@@ -5356,10 +5510,15 @@ z_expand_abbrev:
 
   ; table_addr = z_abbrev_table + 2*entry
   asl
-  clc
-  adc z_abbrev_table
   sta z_story_target
   lda #0
+  rol
+  sta z_story_target+1
+  clc
+  lda z_story_target
+  adc z_abbrev_table
+  sta z_story_target
+  lda z_story_target+1
   adc z_abbrev_table+1
   sta z_story_target+1
   lda #0
@@ -5370,21 +5529,28 @@ z_expand_abbrev:
   bcc :+
   jmp z_decode_fail
 :
+  sta z_tmp2                 ; save packed hi byte (low is still in X)
 
-  ; Save current decode pointer and shift state.
+  ; Save outer packed word bytes plus current decode pointer/state.
+  ; Remaining zchars from the outer word are processed after this call.
+  lda z_zs_word_hi
+  pha
+  lda z_zs_word_lo
+  pha
   lda z_zs_ptr
   pha
   lda z_zs_ptr+1
   pha
   lda z_zs_shift       ; save shift state (abbrev padding leaves z_zs_shift=2)
   pha
+  lda z_zs_endflag     ; preserve outer-string termination flag across recursion
+  pha
 
   ; packed -> byte address (v3): addr = packed * 2
-  pha
   txa
   asl
   sta z_zs_ptr
-  pla
+  lda z_tmp2
   rol
   sta z_zs_ptr+1
 
@@ -5392,12 +5558,18 @@ z_expand_abbrev:
   bcs z_expand_restore_fail
 
 z_expand_restore:
-  pla                  ; restore z_zs_shift (pushed last)
+  pla                  ; restore outer z_zs_endflag (pushed last)
+  sta z_zs_endflag
+  pla                  ; restore z_zs_shift
   sta z_zs_shift
   pla
   sta z_zs_ptr+1
   pla
   sta z_zs_ptr
+  pla
+  sta z_zs_word_lo
+  pla
+  sta z_zs_word_hi
   rts
 
 z_expand_restore_fail:
@@ -5523,4 +5695,4 @@ z_bit_mask:
   .include "../sdcard6502/src/hwconfig.s"
   .include "../sdcard6502/src/libsd.s"
   .include "../sdcard6502/src/libfat32.s"
-  .include "../sdcard6502/src/libio.s"
+    .include "libio.s"

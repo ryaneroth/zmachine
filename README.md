@@ -1,6 +1,6 @@
 # KIM-1 Z-Machine
 
-A Z-machine runtime implementation for the KIM-1 6502 microcomputer, enabling playable interactive fiction games on vintage hardware.
+This project is a Z-machine-capable runtime for the KIM-1.
 
 ![Zork I](zork.png)
 

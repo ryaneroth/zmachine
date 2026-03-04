@@ -1,10 +1,12 @@
-# KIM-1 Z-Machine (WIP)
+# KIM-1 Z-Machine
 
-This project is the follow-on to our KIM-1 Adventure work: porting/creating a Z-machine-capable runtime for the KIM-1.
+A Z-machine runtime implementation for the KIM-1 6502 microcomputer, enabling playable interactive fiction games on vintage hardware.
 
 ![Zork I](zork.png)
 
-It reuses the SD/FAT32 libraries that were polished during the Adventure effort, so story/game data can be loaded from SD card storage.
+## Overview
+
+This project ports a Z-machine-capable runtime to the KIM-1, building on the storage infrastructure developed during the KIM-1 Adventure project. Game data loads from SD card storage using integrated SD/FAT32 libraries.
 
 ## Project Goal
 
@@ -12,7 +14,7 @@ Build a practical Z-machine implementation for KIM-1-class hardware, in staged m
 
 ## Status
 
-This repository is currently early/in-progress:
+Currently in active development:
 
 - SD + FAT32 support libraries from the Adventure project are integrated.
 - Loader functionality is maintained in `sdcard6502/src/loadfile.s` (upstream shared source).
@@ -98,23 +100,32 @@ Once loaded/executed on the KIM-1, `zmachine` currently provides:
    - `E` exit
 
 The VM loop is still intentionally incomplete, but now includes:
+
 - 0OP handling for `RTRUE`, `RFALSE`, `PRINT`, `PRINT_RET`, `NEW_LINE`, `NOP`, `QUIT`
-- additional 0OP control support (`SAVE`/`RESTORE` branch stubs, `RESTART`, `RET_POPPED`, `POP`, `VERIFY`)
+- Additional 0OP control support (`SAVE`/`RESTORE` branch stubs, `RESTART`, `RET_POPPED`, `POP`, `VERIFY`)
 - VAR `CALL` (`0xE0`) operand decode path with routine invocation scaffolding
 - VAR 2OP form decoding (`C0..DF`) and extra call forms (`CALL_2S`, `CALL_2N`, `CALL_VS2`, `CALL_VN`, `CALL_VN2`)
-- early short-form 1OP handling (`JZ`, `RET`, `JUMP`, `LOAD`) with branch parsing
-- additional 1OP object handling (`GET_SIBLING`, `GET_CHILD`, `GET_PARENT`, `REMOVE_OBJ`)
-- more 1OP support (`INC`, `DEC`, `PRINT_ADDR`, `CALL_1S`)
-- broader 2OP handling: compares/branches, arithmetic, memory/property access (`GET_PROP`, `GET_PROP_ADDR`, `GET_NEXT_PROP`) and object ops (`JIN`, `TEST_ATTR`, `SET_ATTR`, `CLEAR_ATTR`, `INSERT_OBJ`)
-- additional 1OP utilities (`GET_PROP_LEN`, `PRINT_OBJ`, `PRINT_PADDR`)
+- Early short-form 1OP handling (`JZ`, `RET`, `JUMP`, `LOAD`) with branch parsing
+- Additional 1OP object handling (`GET_SIBLING`, `GET_CHILD`, `GET_PARENT`, `REMOVE_OBJ`)
+- More 1OP support (`INC`, `DEC`, `PRINT_ADDR`, `CALL_1S`)
+- Broader 2OP handling: compares/branches, arithmetic, memory/property access (`GET_PROP`, `GET_PROP_ADDR`, `GET_NEXT_PROP`) and object ops (`JIN`, `TEST_ATTR`, `SET_ATTR`, `CLEAR_ATTR`, `INSERT_OBJ`)
+- Additional 1OP utilities (`GET_PROP_LEN`, `PRINT_OBJ`, `PRINT_PADDR`)
 - VAR utility ops (`STOREW`, `STOREB`, `PUT_PROP`, `SREAD` with multi-token parse-buffer output + dictionary lookup, `PRINT_CHAR`, `PRINT_NUM`, `RANDOM`, `PUSH`, `PULL`)
 - 32-step trace mode (`T`) to accelerate opcode bring-up (`PC:OP`)
 
-Important current limitation: only a subset of instruction forms/opcodes are implemented; full branch/store/object/property semantics are still in progress.
+**Important current limitation**: Only a subset of instruction forms/opcodes are implemented; full branch/store/object/property semantics are still in progress.
 
 ## Notes
 
-- The active Makefile target is `zmachine.s`.
-- Loader builds/tests should be run from `sdcard6502/src`.
-- SD wiring assumptions are defined in `sdcard6502/src/hwconfig.s` (`SD_CS`, `SD_SCK`, `SD_MOSI`, `SD_MISO` on VIA Port A bits).
-- Z-machine execution is still under active development; full gameplay compatibility is not yet implemented.
+- The active Makefile target is `zmachine.s`
+- Loader builds/tests should be run from `sdcard6502/src`
+- SD wiring assumptions are defined in `sdcard6502/src/hwconfig.s` (`SD_CS`, `SD_SCK`, `SD_MOSI`, `SD_MISO` on VIA Port A bits)
+- Z-machine execution is still under active development; full gameplay compatibility is not yet implemented
+
+## Credits
+
+This project was developed with contributions from:
+
+- **Ryan Roth** – Project lead and primary implementation
+- **Claude** – Code assistance and architecture guidance
+- **Codex** – Code generation and implementation support

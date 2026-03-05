@@ -76,6 +76,8 @@ z_text_base_off      = $9A   ; sread text buffer char base offset (v<=4:1, v>=5:
 z_pc_ext             = $9B   ; high byte for 24-bit story PC
 z_zs_ptr_ext         = $9C   ; high byte for z_zs_ptr during decode
 z_ptr_ext            = $9D   ; generic high byte for z_work_ptr-based code pointers
+z_cache_base_hi      = $9E   ; high byte for runtime static-sector cache base
+z_cache_enabled      = $9F   ; 0=disabled, 1=enabled
 z_prop_ptr           = $80   ; 16-bit property scan/data pointer
 z_prop_num           = $82   ; property number scratch
 z_prop_size          = $83   ; property size scratch
@@ -104,6 +106,9 @@ subdir_cluster_table = $0540 ; 8 entries * 4-byte start cluster
 fake_dirent          = $0560 ; synthetic 32-byte dirent for cluster-open
 story_name           = $0580 ; 12-byte 8.3 name buffer (must be RAM, not ROM)
 call_arg_buf         = $0590 ; 8 decoded operands (16 bytes, lo/hi pairs)
+story_cache_valid    = $05A0 ; 8-byte valid flags
+story_cache_tag_lo   = $05A8 ; 8-byte sector tag low bytes
+story_cache_tag_hi   = $05B0 ; 8-byte sector tag high bytes
 z_dynamic_base       = $2000 ; dynamic story bytes (0 .. static_base-1)
 z_eval_stack_base    = $8000 ; eval stack
 z_call_stack_base    = $8800 ; call frame stack
@@ -729,6 +734,7 @@ story_rewind_open:
   sta z_story_pos
   sta z_story_pos+1
   sta z_story_pos+2
+  jsr story_cache_invalidate
   clc
   rts
 story_rewind_fail:
@@ -862,6 +868,7 @@ boot_story:
   bcc :+
   jmp boot_fail
 :
+  jsr story_cache_configure
   jsr z_vm_reset_stacks
 
   lda #1
@@ -940,6 +947,142 @@ story_read_byte_at_target:
   rts
 story_read_fail:
   sec
+  rts
+
+; Invalidate all static-sector cache lines.
+story_cache_invalidate:
+  lda #0
+  sta z_cache_enabled
+  ldx #7
+:
+  sta story_cache_valid,x
+  dex
+  bpl :-
+  rts
+
+; Configure cache placement after dynamic memory is loaded.
+; cache_base = align_up(z_dynamic_base + z_static_base, 256)
+; cache size is 4KB (8 sectors). If no room before eval stack, disable cache.
+story_cache_configure:
+  jsr story_cache_invalidate
+  lda z_static_base+1
+  clc
+  adc #>z_dynamic_base
+  tax
+  lda z_static_base
+  beq :+
+  inx
+:
+  ; Need base_hi <= $70 so [base .. base+0x0FFF] stays below $8000.
+  cpx #$71
+  bcs :+
+  stx z_cache_base_hi
+  lda #1
+  sta z_cache_enabled
+:
+  rts
+
+; Compute story sector index (target >> 9) into z_seek_tsec_lo/hi.
+story_target_to_sector:
+  lda z_story_target+2
+  lsr
+  sta z_seek_tsec_hi
+  lda z_story_target+1
+  ror
+  sta z_seek_tsec_lo
+  rts
+
+; Cached static-byte read at z_story_target.
+; Uses a direct-mapped 8-line sector cache in RAM.
+story_read_byte_cached_at_target:
+  lda z_cache_enabled
+  bne :+
+  jmp story_read_byte_at_target
+:
+  jsr story_target_in_range
+  bcc :+
+  lda #0
+  clc
+  rts
+:
+  jsr story_target_to_sector
+  lda z_seek_tsec_lo
+  and #$07
+  tax
+  lda story_cache_valid,x
+  beq story_cache_miss
+  lda story_cache_tag_lo,x
+  cmp z_seek_tsec_lo
+  bne story_cache_miss
+  lda story_cache_tag_hi,x
+  cmp z_seek_tsec_hi
+  bne story_cache_miss
+
+story_cache_hit:
+  ; line base = runtime_cache_base + slot*512
+  lda z_story_target
+  sta z_work_ptr
+  txa
+  asl
+  clc
+  adc z_cache_base_hi
+  sta z_work_ptr+1
+  lda z_story_target+1
+  and #$01
+  clc
+  adc z_work_ptr+1
+  sta z_work_ptr+1
+  ldy #0
+  lda (z_work_ptr),y
+  clc
+  rts
+
+story_cache_miss:
+  ; Fallback to normal stream read, then cache the full sector.
+  txa
+  pha                            ; save cache slot across miss path
+  jsr story_read_byte_at_target
+  bcc :+
+  pla
+  rts
+:
+  tay                            ; preserve returned byte
+  jsr story_target_to_sector     ; restore sector tag after seek/read clobbers
+  pla
+  tax
+  tya
+  pha                            ; preserve returned byte across sector copy
+  lda z_seek_tsec_lo
+  sta story_cache_tag_lo,x
+  lda z_seek_tsec_hi
+  sta story_cache_tag_hi,x
+  lda #1
+  sta story_cache_valid,x
+
+  ; Copy fat32_readbuffer (512 bytes) into selected cache line.
+  txa
+  asl
+  clc
+  adc z_cache_base_hi
+  sta z_work_ptr+1
+  lda #0
+  sta z_work_ptr
+  ldy #0
+story_cache_copy_page0:
+  lda fat32_readbuffer,y
+  sta (z_work_ptr),y
+  iny
+  bne story_cache_copy_page0
+  inc z_work_ptr+1
+  ldy #0
+story_cache_copy_page1:
+  lda fat32_readbuffer+$100,y
+  sta (z_work_ptr),y
+  iny
+  bne story_cache_copy_page1
+
+  pla
+  clc
   rts
 
 ; Reads big-endian word at z_story_target.
@@ -1033,6 +1176,20 @@ seek_check_sector:
   lda z_seek_tsec_hi
   cmp z_seek_csec_hi
   bne seek_check_next
+  ; If the previous read ended at buffer+512, the next sector has not yet been
+  ; loaded. Pull it in before doing an in-sector pointer reposition.
+  lda zp_sd_address+1
+  cmp #>(fat32_readbuffer+$200)
+  bcc seek_same_sector_ready
+  lda #<fat32_readbuffer
+  sta fat32_address
+  lda #>fat32_readbuffer
+  sta fat32_address+1
+  jsr fat32_readnextsector
+  bcc seek_same_sector_ready
+  ; Recover from stale chain state by forcing an absolute seek.
+  jmp seek_force_full
+seek_same_sector_ready:
   lda z_story_target
   sta zp_sd_address
   lda z_story_target+1
@@ -1333,7 +1490,19 @@ z_mem_read_static_ext:
   sta z_story_target+1
   tya
   sta z_story_target+2
-  jsr story_read_byte_at_target
+  ; Preserve z_work_ptr for static reads. Some call paths depend on it
+  ; remaining stable across z_mem_read_byte_ax.
+  lda z_work_ptr+1
+  pha
+  lda z_work_ptr
+  pha
+  jsr story_read_byte_cached_at_target
+  tay
+  pla
+  sta z_work_ptr
+  pla
+  sta z_work_ptr+1
+  tya
   rts
 
 z_mem_read_static_fail:

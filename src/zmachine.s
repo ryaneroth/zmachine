@@ -78,6 +78,15 @@ z_zs_ptr_ext         = $9C   ; high byte for z_zs_ptr during decode
 z_ptr_ext            = $9D   ; generic high byte for z_work_ptr-based code pointers
 z_cache_base_hi      = $9E   ; high byte for runtime static-sector cache base
 z_cache_enabled      = $9F   ; 0=disabled, 1=enabled
+z_save_valid         = $A0   ; 0/1 SAVE snapshot availability (loaded/built)
+z_out3_active        = $A1   ; 0/1 output stream 3 active
+z_out3_ptr           = $A2   ; output stream 3 current write pointer
+z_out3_len           = $A4   ; output stream 3 byte count
+z_out3_table         = $A6   ; output stream 3 table base (word count destination)
+z_zs_shift_once      = $A8   ; v1/v2: 1 when current alphabet shift is temporary
+z_window_lines       = $A9   ; requested split height for upper window
+z_window_active      = $AA   ; 0=lower, 1=upper
+z_input_stream       = $AB   ; 0/1 selected input stream (keyboard/script)
 z_prop_ptr           = $80   ; 16-bit property scan/data pointer
 z_prop_num           = $82   ; property number scratch
 z_prop_size          = $83   ; property size scratch
@@ -109,6 +118,26 @@ call_arg_buf         = $0590 ; 8 decoded operands (16 bytes, lo/hi pairs)
 story_cache_valid    = $05A0 ; 8-byte valid flags
 story_cache_tag_lo   = $05A8 ; 8-byte sector tag low bytes
 story_cache_tag_hi   = $05B0 ; 8-byte sector tag high bytes
+save_buffer          = $0600 ; in-RAM SAVE snapshot
+save_buffer_end      = $2000 ; exclusive end
+save_hdr_pc_lo       = save_buffer+0
+save_hdr_pc_hi       = save_buffer+1
+save_hdr_pc_ext      = save_buffer+2
+save_hdr_sp_lo       = save_buffer+3
+save_hdr_sp_hi       = save_buffer+4
+save_hdr_fp_lo       = save_buffer+5
+save_hdr_fp_hi       = save_buffer+6
+save_hdr_callsp_lo   = save_buffer+7
+save_hdr_callsp_hi   = save_buffer+8
+save_hdr_rng_lo      = save_buffer+9
+save_hdr_rng_hi      = save_buffer+10
+save_hdr_eval_len_lo = save_buffer+11
+save_hdr_eval_len_hi = save_buffer+12
+save_hdr_call_len_lo = save_buffer+13
+save_hdr_call_len_hi = save_buffer+14
+save_hdr_diff_lo     = save_buffer+15
+save_hdr_diff_hi     = save_buffer+16
+save_data_base       = save_buffer+17
 z_dynamic_base       = $2000 ; dynamic story bytes (0 .. static_base-1)
 z_eval_stack_base    = $8000 ; eval stack
 z_call_stack_base    = $8800 ; call frame stack
@@ -1403,6 +1432,18 @@ z_vm_reset_stacks:
   sta z_rng_state_lo
   lda #$00
   sta z_rng_state_hi
+  sta z_save_valid
+  sta z_out3_active
+  sta z_out3_ptr
+  sta z_out3_ptr+1
+  sta z_out3_len
+  sta z_out3_len+1
+  sta z_out3_table
+  sta z_out3_table+1
+  sta z_zs_shift_once
+  sta z_window_lines
+  sta z_window_active
+  sta z_input_stream
   rts
 
 ; Copy dynamic story bytes [0 .. static_base-1] to RAM z_dynamic_base.
@@ -2499,6 +2540,7 @@ z_decode_zstring_words_at_ptr:
   sta z_zs_shift
   sta z_zs_abbrev
   sta z_zs_escape
+  sta z_zs_shift_once
 z_decode_words_loop:
   lda z_work_cnt
   beq z_decode_words_done
@@ -2829,6 +2871,10 @@ zm_step:
   bne :+
   jmp op_new_line
 :
+  cmp #$BC            ; show_status
+  bne :+
+  jmp op_show_status
+:
   cmp #$BD            ; verify
   bne :+
   jmp op_verify
@@ -2873,9 +2919,29 @@ zm_step:
   bne :+
   jmp op_pull_var
 :
+  cmp #$EA            ; split_window
+  bne :+
+  jmp op_split_window_var
+:
+  cmp #$EB            ; set_window
+  bne :+
+  jmp op_set_window_var
+:
   cmp #$EC            ; call_vs2
   bne :+
   jmp op_call_vs2
+:
+  cmp #$F3            ; output_stream
+  bne :+
+  jmp op_output_stream_var
+:
+  cmp #$F4            ; input_stream
+  bne :+
+  jmp op_input_stream_var
+:
+  cmp #$F5            ; sound_effect
+  bne :+
+  jmp op_sound_effect_var
 :
   cmp #$F9            ; call_vn
   bne :+
@@ -4640,7 +4706,7 @@ z_print_num_ax:
   lda z_work_ptr+1
   bpl :+
   lda #'-'
-  jsr print_char
+  jsr z_vm_put_char
   ; negate
   lda z_work_ptr
   eor #$FF
@@ -4714,7 +4780,7 @@ z_print_digit_emit_yes:
   lda z_idx
   clc
   adc #'0'
-  jsr print_char
+  jsr z_vm_put_char
   lda #1
   sta z_tmp
 z_print_digit_skip:
@@ -4842,6 +4908,42 @@ z_encode_pack:
   sta z_enc3
   rts
 
+; Input A=ASCII char.
+; C set if char is listed as a dictionary word-separator.
+z_dict_is_separator:
+  sta z_tmp
+  lda z_dictionary
+  sta z_prop_ptr
+  lda z_dictionary+1
+  sta z_prop_ptr+1
+  lda z_prop_ptr
+  ldx z_prop_ptr+1
+  jsr z_mem_read_byte_ax
+  sta z_work_cnt
+  beq z_dict_sep_no
+  inc z_prop_ptr
+  bne :+
+  inc z_prop_ptr+1
+:
+z_dict_sep_loop:
+  lda z_prop_ptr
+  ldx z_prop_ptr+1
+  jsr z_mem_read_byte_ax
+  cmp z_tmp
+  beq z_dict_sep_yes
+  inc z_prop_ptr
+  bne :+
+  inc z_prop_ptr+1
+:
+  dec z_work_cnt
+  bne z_dict_sep_loop
+z_dict_sep_no:
+  clc
+  rts
+z_dict_sep_yes:
+  sec
+  rts
+
 ; Lookup encoded token z_enc0..z_enc3 in dictionary z_dictionary.
 ; Returns dictionary entry address in z_work_ptr (0 if not found).
 z_dict_lookup_token:
@@ -4957,6 +5059,600 @@ z_dict_not_found:
   sta z_work_ptr+1
   rts
 
+; Seek SD story stream to current VM PC for efficient subsequent static reads.
+z_seek_stream_to_pc:
+  lda z_pc
+  sta z_story_target
+  lda z_pc+1
+  sta z_story_target+1
+  lda z_pc_ext
+  sta z_story_target+2
+  jsr story_seek_to_target
+  rts
+
+; Append byte A to save buffer at z_work_ptr.
+; C set if out of save-buffer space.
+z_save_write_byte_a:
+  pha
+  lda z_work_ptr+1
+  cmp #>save_buffer_end
+  bcs z_save_write_byte_fail
+  ldy #0
+  pla
+  sta (z_work_ptr),y
+  inc z_work_ptr
+  bne :+
+  inc z_work_ptr+1
+:
+  clc
+  rts
+z_save_write_byte_fail:
+  pla
+  sec
+  rts
+
+; Read byte A from save buffer at z_work_ptr and advance.
+; C set if read is out of save-buffer range.
+z_save_read_byte_a:
+  lda z_work_ptr+1
+  cmp #>save_buffer_end
+  bcs z_save_read_byte_fail
+  ldy #0
+  lda (z_work_ptr),y
+  inc z_work_ptr
+  bne :+
+  inc z_work_ptr+1
+:
+  clc
+  rts
+z_save_read_byte_fail:
+  sec
+  rts
+
+; Copy z_work_cnt bytes from source z_prop_ptr into save buffer z_work_ptr.
+; C set on save-buffer overflow.
+z_save_copy_to_buffer:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_save_copy_done
+z_save_copy_loop:
+  ldy #0
+  lda (z_prop_ptr),y
+  jsr z_save_write_byte_a
+  bcs z_save_copy_fail
+  inc z_prop_ptr
+  bne :+
+  inc z_prop_ptr+1
+:
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  lda z_work_cnt
+  ora z_work_cnt+1
+  bne z_save_copy_loop
+z_save_copy_done:
+  clc
+  rts
+z_save_copy_fail:
+  sec
+  rts
+
+; Copy z_work_cnt bytes from save buffer z_work_ptr into destination z_prop_ptr.
+; C set on malformed/overflowing snapshot.
+z_restore_copy_from_buffer:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_restore_copy_done
+z_restore_copy_loop:
+  jsr z_save_read_byte_a
+  bcs z_restore_copy_fail
+  ldy #0
+  sta (z_prop_ptr),y
+  inc z_prop_ptr
+  bne :+
+  inc z_prop_ptr+1
+:
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  lda z_work_cnt
+  ora z_work_cnt+1
+  bne z_restore_copy_loop
+z_restore_copy_done:
+  clc
+  rts
+z_restore_copy_fail:
+  sec
+  rts
+
+z_save_snapshot:
+  lda #0
+  sta z_save_valid
+  ; Save core VM registers.
+  lda z_pc
+  sta save_hdr_pc_lo
+  lda z_pc+1
+  sta save_hdr_pc_hi
+  lda z_pc_ext
+  sta save_hdr_pc_ext
+  lda z_sp
+  sta save_hdr_sp_lo
+  lda z_sp+1
+  sta save_hdr_sp_hi
+  lda z_fp
+  sta save_hdr_fp_lo
+  lda z_fp+1
+  sta save_hdr_fp_hi
+  lda z_callsp
+  sta save_hdr_callsp_lo
+  lda z_callsp+1
+  sta save_hdr_callsp_hi
+  lda z_rng_state_lo
+  sta save_hdr_rng_lo
+  lda z_rng_state_hi
+  sta save_hdr_rng_hi
+  ; eval_len = z_sp - z_eval_stack_base
+  sec
+  lda z_sp
+  sbc #<z_eval_stack_base
+  sta save_hdr_eval_len_lo
+  lda z_sp+1
+  sbc #>z_eval_stack_base
+  sta save_hdr_eval_len_hi
+  ; call_len = z_callsp - z_call_stack_base
+  sec
+  lda z_callsp
+  sbc #<z_call_stack_base
+  sta save_hdr_call_len_lo
+  lda z_callsp+1
+  sbc #>z_call_stack_base
+  sta save_hdr_call_len_hi
+  lda #0
+  sta save_hdr_diff_lo
+  sta save_hdr_diff_hi
+  ; save_ptr = save_data_base
+  lda #<save_data_base
+  sta z_work_ptr
+  lda #>save_data_base
+  sta z_work_ptr+1
+  ; Save used eval stack bytes.
+  lda #<z_eval_stack_base
+  sta z_prop_ptr
+  lda #>z_eval_stack_base
+  sta z_prop_ptr+1
+  lda save_hdr_eval_len_lo
+  sta z_work_cnt
+  lda save_hdr_eval_len_hi
+  sta z_work_cnt+1
+  jsr z_save_copy_to_buffer
+  bcc :+
+  jmp z_save_snapshot_fail
+:
+  ; Save used call stack bytes.
+  lda #<z_call_stack_base
+  sta z_prop_ptr
+  lda #>z_call_stack_base
+  sta z_prop_ptr+1
+  lda save_hdr_call_len_lo
+  sta z_work_cnt
+  lda save_hdr_call_len_hi
+  sta z_work_cnt+1
+  jsr z_save_copy_to_buffer
+  bcc :+
+  jmp z_save_snapshot_fail
+:
+  ; Diff dynamic memory against original story bytes.
+  jsr story_rewind_open
+  bcc :+
+  jmp z_save_snapshot_fail
+:
+  lda #<z_dynamic_base
+  sta z_prop_ptr
+  lda #>z_dynamic_base
+  sta z_prop_ptr+1
+  lda z_static_base
+  sta z_work_cnt
+  lda z_static_base+1
+  sta z_work_cnt+1
+  lda #0
+  sta z_story_target
+  sta z_story_target+1
+  sta z_story_target+2
+z_save_diff_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_save_snapshot_done
+  jsr story_read_byte_at_target
+  bcc :+
+  jmp z_save_snapshot_fail
+:
+  sta z_tmp                    ; original byte
+  ldy #0
+  lda (z_prop_ptr),y           ; current dynamic byte
+  cmp z_tmp
+  beq z_save_diff_next
+  sta z_tmp2                   ; preserve changed byte
+  lda z_story_target
+  jsr z_save_write_byte_a
+  bcs z_save_snapshot_fail
+  lda z_story_target+1
+  jsr z_save_write_byte_a
+  bcs z_save_snapshot_fail
+  lda z_tmp2
+  jsr z_save_write_byte_a
+  bcs z_save_snapshot_fail
+  inc save_hdr_diff_lo
+  bne :+
+  inc save_hdr_diff_hi
+:
+z_save_diff_next:
+  inc z_prop_ptr
+  bne :+
+  inc z_prop_ptr+1
+:
+  jsr target_inc
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  jmp z_save_diff_loop
+
+z_save_snapshot_done:
+  jsr z_save_snapshot_sd_write
+  bcc :+
+  jmp z_save_snapshot_fail
+:
+  jsr z_seek_stream_to_pc
+  lda #1
+  sta z_save_valid
+  clc
+  rts
+
+z_save_snapshot_fail:
+  jsr z_seek_stream_to_pc
+  lda #0
+  sta z_save_valid
+  sec
+  rts
+
+z_restore_snapshot:
+  jsr z_save_snapshot_sd_read
+  bcc :+
+  jsr z_seek_stream_to_pc
+  lda #0
+  sta z_save_valid
+  sec
+  rts
+:
+  lda #1
+  sta z_save_valid
+  ; Rebuild dynamic memory before applying snapshot deltas.
+  jsr load_dynamic_memory
+  bcc :+
+  jsr z_seek_stream_to_pc
+  sec
+  rts
+:
+  lda #<save_data_base
+  sta z_work_ptr
+  lda #>save_data_base
+  sta z_work_ptr+1
+  ; Restore eval stack bytes.
+  lda #<z_eval_stack_base
+  sta z_prop_ptr
+  lda #>z_eval_stack_base
+  sta z_prop_ptr+1
+  lda save_hdr_eval_len_lo
+  sta z_work_cnt
+  lda save_hdr_eval_len_hi
+  sta z_work_cnt+1
+  jsr z_restore_copy_from_buffer
+  bcc :+
+  jmp z_restore_snapshot_fail
+:
+  ; Restore call stack bytes.
+  lda #<z_call_stack_base
+  sta z_prop_ptr
+  lda #>z_call_stack_base
+  sta z_prop_ptr+1
+  lda save_hdr_call_len_lo
+  sta z_work_cnt
+  lda save_hdr_call_len_hi
+  sta z_work_cnt+1
+  jsr z_restore_copy_from_buffer
+  bcc :+
+  jmp z_restore_snapshot_fail
+:
+  ; Apply dynamic-memory diff records.
+  lda save_hdr_diff_lo
+  sta z_work_cnt
+  lda save_hdr_diff_hi
+  sta z_work_cnt+1
+z_restore_diff_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_restore_snapshot_done
+  jsr z_save_read_byte_a
+  bcs z_restore_snapshot_fail
+  sta z_tmp                    ; addr lo
+  jsr z_save_read_byte_a
+  bcs z_restore_snapshot_fail
+  sta z_tmp2                   ; addr hi
+  jsr z_save_read_byte_a
+  bcs z_restore_snapshot_fail
+  sta z_idx                    ; value
+  clc
+  lda z_tmp
+  adc #<z_dynamic_base
+  sta z_prop_ptr
+  lda z_tmp2
+  adc #>z_dynamic_base
+  sta z_prop_ptr+1
+  ldy #0
+  lda z_idx
+  sta (z_prop_ptr),y
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  jmp z_restore_diff_loop
+
+z_restore_snapshot_done:
+  ; Restore saved VM registers.
+  lda save_hdr_pc_lo
+  sta z_pc
+  lda save_hdr_pc_hi
+  sta z_pc+1
+  lda save_hdr_pc_ext
+  sta z_pc_ext
+  lda save_hdr_sp_lo
+  sta z_sp
+  lda save_hdr_sp_hi
+  sta z_sp+1
+  lda save_hdr_fp_lo
+  sta z_fp
+  lda save_hdr_fp_hi
+  sta z_fp+1
+  lda save_hdr_callsp_lo
+  sta z_callsp
+  lda save_hdr_callsp_hi
+  sta z_callsp+1
+  lda save_hdr_rng_lo
+  sta z_rng_state_lo
+  lda save_hdr_rng_hi
+  sta z_rng_state_hi
+  ; Stream 3 does not survive restore.
+  lda #0
+  sta z_out3_active
+  jsr z_seek_stream_to_pc
+  clc
+  rts
+
+z_restore_snapshot_fail:
+  jsr z_seek_stream_to_pc
+  sec
+  rts
+
+z_out3_flush_len:
+  lda z_out3_table
+  sta z_work_ptr
+  lda z_out3_table+1
+  sta z_work_ptr+1
+  lda z_out3_len
+  ldx z_out3_len+1
+  jsr z_mem_write_word_ax
+  rts
+
+; Read global variable Y (0-based) into A=lo, X=hi.
+z_status_get_global_word:
+  tya
+  asl
+  sta z_work_ptr
+  lda #0
+  rol
+  sta z_work_ptr+1
+  clc
+  lda z_work_ptr
+  adc z_global_table
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc z_global_table+1
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jmp z_mem_read_word_ax
+
+; Compute serialized snapshot byte count into z_work_cnt (and A/X).
+; size = 17 + eval_len + call_len + 3*diff_count
+z_save_snapshot_size:
+  lda #<(save_data_base-save_buffer)
+  sta z_work_cnt
+  lda #>(save_data_base-save_buffer)
+  sta z_work_cnt+1
+  clc
+  lda z_work_cnt
+  adc save_hdr_eval_len_lo
+  sta z_work_cnt
+  lda z_work_cnt+1
+  adc save_hdr_eval_len_hi
+  sta z_work_cnt+1
+  clc
+  lda z_work_cnt
+  adc save_hdr_call_len_lo
+  sta z_work_cnt
+  lda z_work_cnt+1
+  adc save_hdr_call_len_hi
+  sta z_work_cnt+1
+  ; diff3 = diff + 2*diff
+  lda save_hdr_diff_lo
+  sta z_tmp
+  lda save_hdr_diff_hi
+  sta z_tmp2
+  lda z_tmp
+  sta z_work_ptr
+  lda z_tmp2
+  sta z_work_ptr+1
+  asl z_tmp
+  rol z_tmp2
+  clc
+  lda z_tmp
+  adc z_work_ptr
+  sta z_tmp
+  lda z_tmp2
+  adc z_work_ptr+1
+  sta z_tmp2
+  clc
+  lda z_work_cnt
+  adc z_tmp
+  sta z_work_cnt
+  lda z_work_cnt+1
+  adc z_tmp2
+  sta z_work_cnt+1
+  lda z_work_cnt
+  ldx z_work_cnt+1
+  rts
+
+; Persist current save_buffer snapshot to SD card save file.
+; C clear on success.
+z_save_snapshot_sd_write:
+  jsr z_save_snapshot_size
+  ; Keep size in z_div_q while FAT32 APIs clobber counters.
+  sta z_div_q_lo
+  stx z_div_q_hi
+  ; Remove previous save file if present.
+  jsr fat32_openroot
+  ldx #<z_save_filename
+  ldy #>z_save_filename
+  jsr fat32_finddirent
+  bcs :+
+  jsr fat32_deletefile
+:
+  ; Allocate clusters for replacement save file.
+  lda z_div_q_lo
+  sta fat32_bytesremaining
+  lda z_div_q_hi
+  sta fat32_bytesremaining+1
+  jsr fat32_allocatefile
+  bcc :+
+  sec
+  rts
+:
+  ; Create root dir entry with the allocated cluster chain.
+  jsr fat32_openroot
+  lda #<z_save_filename
+  sta fat32_filenamepointer
+  lda #>z_save_filename
+  sta fat32_filenamepointer+1
+  lda z_div_q_lo
+  sta fat32_bytesremaining
+  lda z_div_q_hi
+  sta fat32_bytesremaining+1
+  jsr fat32_writedirent
+  bcc :+
+  sec
+  rts
+:
+  ; Write snapshot bytes from save_buffer.
+  lda #<save_buffer
+  sta fat32_address
+  lda #>save_buffer
+  sta fat32_address+1
+  lda z_div_q_lo
+  sta fat32_bytesremaining
+  lda z_div_q_hi
+  sta fat32_bytesremaining+1
+  jsr fat32_file_write
+  clc
+  rts
+
+; Load snapshot bytes from SD save file into save_buffer.
+; C clear on success.
+z_save_snapshot_sd_read:
+  jsr fat32_openroot
+  ldx #<z_save_filename
+  ldy #>z_save_filename
+  jsr fat32_finddirent
+  bcc :+
+  sec
+  rts
+:
+  jsr fat32_opendirent
+  ; Require <= 16-bit size and <= save buffer capacity.
+  lda fat32_bytesremaining+2
+  ora fat32_bytesremaining+3
+  beq :+
+  sec
+  rts
+:
+  lda fat32_bytesremaining+1
+  cmp #>(save_buffer_end-save_buffer)
+  bcc :+
+  bne z_save_snapshot_sd_read_fail
+  lda fat32_bytesremaining
+  beq :+
+z_save_snapshot_sd_read_fail:
+  sec
+  rts
+:
+  lda fat32_bytesremaining
+  sta z_div_q_lo              ; source file byte count
+  sta z_work_cnt
+  lda fat32_bytesremaining+1
+  sta z_div_q_hi
+  sta z_work_cnt+1
+  ; Need at least fixed header.
+  lda z_div_q_hi
+  bne :+
+  lda z_div_q_lo
+  cmp #<(save_data_base-save_buffer)
+  bcs :+
+  sec
+  rts
+:
+  lda #<save_buffer
+  sta z_work_ptr
+  lda #>save_buffer
+  sta z_work_ptr+1
+z_save_sd_read_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_save_sd_read_done
+  jsr fat32_file_readbyte
+  bcc :+
+  sec
+  rts
+:
+  ldy #0
+  sta (z_work_ptr),y
+  inc z_work_ptr
+  bne :+
+  inc z_work_ptr+1
+:
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  jmp z_save_sd_read_loop
+
+z_save_sd_read_done:
+  ; Validate declared snapshot size matches file size.
+  jsr z_save_snapshot_size
+  txa
+  cmp z_div_q_hi
+  bne z_save_snapshot_sd_read_fail
+  lda z_work_cnt
+  cmp z_div_q_lo
+  bne z_save_snapshot_sd_read_fail
+  clc
+  rts
+
 zm_unknown_opcode:
   jsr newline
   ldx #<msg_unknown
@@ -5012,13 +5708,22 @@ op_nop:
   rts
 
 op_save:
-  ; No save support yet: branch as false.
+  jsr z_save_snapshot
+  bcc :+
   lda #0
+  jmp z_branch_on_bool
+:
+  lda #1
   jmp z_branch_on_bool
 
 op_restore:
-  ; No restore support yet: branch as false.
+  jsr z_restore_snapshot
+  bcc :+
   lda #0
+  jmp z_branch_on_bool
+:
+  ; Successful restore resumes at the saved SAVE opcode's branch path.
+  lda #1
   jmp z_branch_on_bool
 
 op_restart:
@@ -5036,13 +5741,227 @@ op_pop:
   rts
 
 op_new_line:
+  jsr z_vm_newline
+  clc
+  rts
+
+op_show_status:
+  ; Console rendering of V3 status info:
+  ; room name, then either "Score/Turns" or "Time".
+  lda z_out3_active
+  pha
+  lda #0
+  sta z_out3_active
   jsr newline
+  ldy #0
+  jsr z_status_get_global_word
+  jsr z_print_obj_name
+  ldx #<msg_status_sep
+  ldy #>msg_status_sep
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
+  lda #1
+  ldx #0
+  jsr z_mem_read_byte_ax
+  bcc :+
+  lda #0
+:
+  and #$02
+  bne z_show_status_time
+  ldx #<msg_status_score
+  ldy #>msg_status_score
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
+  ldy #1
+  jsr z_status_get_global_word
+  jsr z_print_num_ax
+  ldx #<msg_status_turns
+  ldy #>msg_status_turns
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
+  ldy #2
+  jsr z_status_get_global_word
+  jsr z_print_num_ax
+  jmp z_show_status_done
+
+z_show_status_time:
+  ldx #<msg_status_time
+  ldy #>msg_status_time
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
+  ldy #1
+  jsr z_status_get_global_word
+  sta z_tmp                      ; hour (0..23)
+  lda #'A'
+  sta z_div_d_lo                 ; AM/PM first char
+  lda #'M'
+  sta z_div_d_hi                 ; second char
+  lda z_tmp
+  cmp #12
+  bcc z_show_status_time_am
+  bne z_show_status_time_pm
+  lda #'P'
+  sta z_div_d_lo
+  jmp z_show_status_time_hour
+z_show_status_time_pm:
+  lda #'P'
+  sta z_div_d_lo
+  sec
+  lda z_tmp
+  sbc #12
+  sta z_tmp
+  jmp z_show_status_time_hour
+z_show_status_time_am:
+  lda z_tmp
+  bne z_show_status_time_hour
+  lda #12
+  sta z_tmp
+z_show_status_time_hour:
+  lda z_tmp
+  ldx #0
+  jsr z_print_num_ax
+  lda #':'
+  jsr print_char
+  ldy #2
+  jsr z_status_get_global_word
+  sta z_tmp                      ; minute
+  cmp #10
+  bcs :+
+  lda #'0'
+  jsr print_char
+:
+  lda z_tmp
+  ldx #0
+  jsr z_print_num_ax
+  lda #' '
+  jsr print_char
+  lda z_div_d_lo
+  jsr print_char
+  lda z_div_d_hi
+  jsr print_char
+
+z_show_status_done:
+  jsr newline
+  pla
+  sta z_out3_active
   clc
   rts
 
 op_verify:
-  ; Treat as verified for now.
+  ; V1-V3 checksum over bytes [0x40 .. file_length-1], modulo 16 bits.
+  lda #$1A
+  ldx #$00
+  jsr z_mem_read_word_ax
+  bcc :+
+  lda #0
+  jmp z_branch_on_bool
+:
+  ; Header file length is in 2-byte units for V1-V3.
+  stx z_work_cnt+1
+  sta z_work_cnt
+  asl z_work_cnt
+  rol z_work_cnt+1
+  lda #0
+  adc #0
+  sta z_ptr_ext                 ; 24-bit file length high byte
+  ; Missing file length => treat as success.
+  lda z_work_cnt
+  ora z_work_cnt+1
+  ora z_ptr_ext
+  bne :+
   lda #1
+  jmp z_branch_on_bool
+:
+  ; Expected checksum word at header 0x1C.
+  lda #$1C
+  ldx #$00
+  jsr z_mem_read_word_ax
+  bcc :+
+  lda #0
+  jmp z_branch_on_bool
+:
+  sta z_div_q_lo                ; expected checksum lo
+  stx z_div_q_hi                ; expected checksum hi
+  ; If file length <= 0x40, checksum range is empty => sum 0.
+  lda z_ptr_ext
+  bne z_verify_have_bytes
+  lda z_work_cnt+1
+  cmp #$00
+  bne z_verify_have_bytes
+  lda z_work_cnt
+  cmp #$41
+  bcs z_verify_have_bytes
+  lda #0
+  sta z_div_r_lo
+  sta z_div_r_hi
+  jmp z_verify_compare
+
+z_verify_have_bytes:
+  ; count = file_len - 0x40
+  sec
+  lda z_work_cnt
+  sbc #$40
+  sta z_work_cnt
+  lda z_work_cnt+1
+  sbc #$00
+  sta z_work_cnt+1
+  lda z_ptr_ext
+  sbc #$00
+  sta z_ptr_ext
+  ; target = 0x000040
+  lda #$40
+  sta z_story_target
+  lda #0
+  sta z_story_target+1
+  sta z_story_target+2
+  lda #0
+  sta z_div_r_lo                ; running checksum lo
+  sta z_div_r_hi                ; running checksum hi
+
+z_verify_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  ora z_ptr_ext
+  beq z_verify_compare
+  jsr story_read_byte_at_target
+  bcc :+
+  lda #0
+  jmp z_branch_on_bool
+:
+  clc
+  adc z_div_r_lo
+  sta z_div_r_lo
+  lda z_div_r_hi
+  adc #0
+  sta z_div_r_hi
+  jsr target_inc
+  lda z_work_cnt
+  bne z_verify_dec_lo
+  lda z_work_cnt+1
+  bne z_verify_dec_mid
+  dec z_ptr_ext
+z_verify_dec_mid:
+  dec z_work_cnt+1
+z_verify_dec_lo:
+  dec z_work_cnt
+  jmp z_verify_loop
+
+z_verify_compare:
+  jsr z_seek_stream_to_pc
+  lda z_div_r_lo
+  cmp z_div_q_lo
+  bne :+
+  lda z_div_r_hi
+  cmp z_div_q_hi
+  bne :+
+  lda #1
+  jmp z_branch_on_bool
+:
+  lda #0
   jmp z_branch_on_bool
 
 op_print:
@@ -5055,7 +5974,7 @@ op_print:
 
 op_print_ret:
   jsr z_print_inline_zstring
-  jsr newline
+  jsr z_vm_newline
   lda #1
   ldx #0
   jmp z_return_word
@@ -5207,6 +6126,12 @@ op_sread_var:
   jsr zm_decode_var_operands
   bcc :+
   jmp zm_stop
+:
+  ; Script input stream is not implemented yet; fall back to keyboard.
+  lda z_input_stream
+  beq :+
+  lda #0
+  sta z_input_stream
 :
   ; text buffer base in op1, parse buffer base in op2
   lda z_op1_lo
@@ -5382,6 +6307,31 @@ z_sread_skip_spaces:
 z_sread_token_start_found:
   lda #0
   sta z_tok_len
+  ; Dictionary separators form one-character tokens.
+  clc
+  lda z_op1_lo
+  adc z_text_base_off
+  adc z_tok_start
+  sta z_work_ptr
+  lda z_op1_hi
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_byte_ax
+  lda z_prop_ptr
+  sta menu_ptr
+  lda z_prop_ptr+1
+  sta menu_ptr+1
+  jsr z_dict_is_separator
+  lda menu_ptr
+  sta z_prop_ptr
+  lda menu_ptr+1
+  sta z_prop_ptr+1
+  bcc z_sread_count_token
+  lda #1
+  sta z_tok_len
+  jmp z_sread_token_ready
 z_sread_count_token:
   lda z_tok_start
   clc
@@ -5402,6 +6352,16 @@ z_sread_count_token:
   jsr z_mem_read_byte_ax
   cmp #' '
   beq z_sread_token_ready
+  lda z_prop_ptr
+  sta menu_ptr
+  lda z_prop_ptr+1
+  sta menu_ptr+1
+  jsr z_dict_is_separator
+  lda menu_ptr
+  sta z_prop_ptr
+  lda menu_ptr+1
+  sta z_prop_ptr+1
+  bcs z_sread_token_ready
   inc z_tok_len
   jmp z_sread_count_token
 
@@ -5494,7 +6454,7 @@ op_print_char_var:
   jmp zm_stop
 :
   lda z_op1_lo
-  jsr print_char
+  jsr z_vm_put_char
   clc
   rts
 
@@ -5631,6 +6591,109 @@ op_pull_var:
   jsr z_pop_word
   jsr z_set_var_word
   clc
+  rts
+
+op_split_window_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  ; Track requested split height; if collapsed, force lower window active.
+  lda z_op1_lo
+  sta z_window_lines
+  bne :+
+  lda #0
+  sta z_window_active
+:
+  clc
+  rts
+
+op_set_window_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  ; Only lower/upper windows are valid in V3.
+  lda z_op1_lo
+  and #$01
+  sta z_window_active
+  ; Can't stay in upper window with zero split lines.
+  lda z_window_lines
+  bne :+
+  lda #0
+  sta z_window_active
+:
+  clc
+  rts
+
+op_input_stream_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  ; Track requested stream. Keyboard (0) is always supported; script input
+  ; stream (1) is tracked but currently falls back to keyboard at read time.
+  lda z_op1_lo
+  cmp #1
+  beq :+
+  lda #0
+: sta z_input_stream
+  clc
+  rts
+
+op_sound_effect_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  ; No sound hardware support.
+  clc
+  rts
+
+op_output_stream_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  ; Stream number is signed in op1.
+  lda z_op1_hi
+  bmi z_output_stream_disable
+  lda z_op1_lo
+  cmp #3
+  bne :+
+  ; Enable stream 3 (memory table at operand 2).
+  lda z_opcount
+  cmp #2
+  bcc :+
+  lda z_op2_lo
+  sta z_out3_table
+  lda z_op2_hi
+  sta z_out3_table+1
+  clc
+  lda z_op2_lo
+  adc #2
+  sta z_out3_ptr
+  lda z_op2_hi
+  adc #0
+  sta z_out3_ptr+1
+  lda #0
+  sta z_out3_len
+  sta z_out3_len+1
+  lda #1
+  sta z_out3_active
+: clc
+  rts
+
+z_output_stream_disable:
+  lda z_op1_lo
+  cmp #$FD                    ; -3
+  bne :+
+  lda z_out3_active
+  beq :+
+  jsr z_out3_flush_len
+  lda #0
+  sta z_out3_active
+: clc
   rts
 
 ; Decode up to 4 operands using a VAR-form type byte.
@@ -6055,6 +7118,7 @@ z_decode_zstring_at_ptr:
   sta z_zs_shift
   sta z_zs_abbrev
   sta z_zs_escape
+  sta z_zs_shift_once
 
 z_decode_word_loop:
   lda z_zs_ptr
@@ -6144,6 +7208,7 @@ z_process_zchar:
   asl
   ora z_idx
   jsr z_emit_zscii
+  jsr z_reset_shift_after_emit
   lda #0
   sta z_zs_escape
   clc
@@ -6166,30 +7231,106 @@ z_process_no_escape:
   lda #0
   sta z_zs_abbrev
   sta z_zs_shift
+  sta z_zs_shift_once
   clc
   rts
 
 z_process_not_abbrev:
+  lda z_story_version
+  cmp #3
+  bcc z_process_v12
   lda z_idx
   beq z_emit_space
   cmp #4
-  bcc z_set_abbrev_prefix
-  beq z_shift_a1
+  bcs :+
+  jmp z_set_abbrev_prefix
+:
+  bne :+
+  jmp z_shift_a1
+:
   cmp #5
-  beq z_shift_a2
+  bne :+
+  jmp z_shift_a2
+:
 
   ; Printable zchar 6..31 from selected alphabet (A0/A1/A2).
   lda z_zs_shift
-  beq z_emit_a0
+  bne :+
+  jmp z_emit_a0
+:
   cmp #1
-  beq z_emit_a1
+  bne :+
+  jmp z_emit_a1
+:
   jmp z_emit_a2
+
+z_process_v12:
+  lda z_idx
+  beq z_emit_space
+  cmp #1
+  beq z_v12_char1
+  cmp #2
+  beq z_v12_shift1
+  cmp #3
+  beq z_v12_shift2
+  cmp #4
+  beq z_v12_shiftlock1
+  cmp #5
+  beq z_v12_shiftlock2
+  ; Printable zchar 6..31 from selected alphabet (A0/A1/A2).
+  lda z_zs_shift
+  bne :+
+  jmp z_emit_a0
+:
+  cmp #1
+  bne :+
+  jmp z_emit_a1
+:
+  jmp z_emit_a2
+
+z_v12_char1:
+  lda z_story_version
+  cmp #2
+  bne z_v1_emit_newline
+  ; V2: one abbreviation table only (entries 0..31).
+  lda #1
+  sta z_zs_abbrev
+  clc
+  rts
+z_v1_emit_newline:
+  jsr z_vm_newline
+  jsr z_reset_shift_after_emit
+  clc
+  rts
+
+z_v12_shift1:
+  lda #1
+  jsr z_v12_shift_temp
+  clc
+  rts
+
+z_v12_shift2:
+  lda #2
+  jsr z_v12_shift_temp
+  clc
+  rts
+
+z_v12_shiftlock1:
+  lda #1
+  jsr z_v12_shift_lock
+  clc
+  rts
+
+z_v12_shiftlock2:
+  lda #2
+  jsr z_v12_shift_lock
+  clc
+  rts
 
 z_emit_space:
   lda #' '
-  jsr print_char
-  lda #0
-  sta z_zs_shift
+  jsr z_vm_put_char
+  jsr z_reset_shift_after_emit
   clc
   rts
 
@@ -6198,30 +7339,85 @@ z_set_abbrev_prefix:
   sta z_zs_abbrev
   lda #0
   sta z_zs_shift
+  sta z_zs_shift_once
   clc
   rts
 
 z_shift_a1:
   lda #1
   sta z_zs_shift
+  lda #1
+  sta z_zs_shift_once
   clc
   rts
 
 z_shift_a2:
   lda #2
   sta z_zs_shift
+  lda #1
+  sta z_zs_shift_once
   clc
   rts
 
+z_v12_shift_temp:
+  sta z_tmp
+  lda z_zs_shift
+  clc
+  adc z_tmp
+  cmp #3
+  bcc z_v12_shift_temp_store
+  sec
+  sbc #3
+z_v12_shift_temp_store:
+  sta z_zs_shift
+  lda #1
+  sta z_zs_shift_once
+  clc
+  rts
+
+z_v12_shift_lock:
+  sta z_tmp
+  lda z_zs_shift
+  clc
+  adc z_tmp
+  cmp #3
+  bcc z_v12_shift_lock_store
+  sec
+  sbc #3
+z_v12_shift_lock_store:
+  sta z_zs_shift
+  lda #0
+  sta z_zs_shift_once
+  clc
+  rts
+
+z_reset_shift_after_emit:
+  lda z_story_version
+  cmp #3
+  bcc z_reset_shift_v12
+  lda #0
+  sta z_zs_shift
+  sta z_zs_shift_once
+  rts
+z_reset_shift_v12:
+  lda z_zs_shift_once
+  beq :+
+  lda #0
+  sta z_zs_shift
+  sta z_zs_shift_once
+: rts
+
+;------------------------------------------------------------
+; Alphabet emitters
+;------------------------------------------------------------
 z_emit_a0:
   lda z_idx
   sec
   sbc #6
   clc
   adc #'a'
-  jsr print_char
-  lda #0
-  sta z_zs_shift
+  jsr z_vm_put_char
+  jsr z_reset_shift_after_emit
   clc
   rts
 
@@ -6231,22 +7427,42 @@ z_emit_a1:
   sbc #6
   clc
   adc #'A'
-  jsr print_char
-  lda #0
-  sta z_zs_shift
+  jsr z_vm_put_char
+  jsr z_reset_shift_after_emit
   clc
   rts
 
 z_emit_a2:
+  lda z_story_version
+  cmp #2
+  bcs z_emit_a2_v2plus
+  ; V1: zchar 6 is newline, zchars 7..31 use V1 A2 table.
+  lda z_idx
+  cmp #6
+  bne z_emit_a2_v1_table
+  jsr z_vm_newline
+  jsr z_reset_shift_after_emit
+  clc
+  rts
+z_emit_a2_v1_table:
+  sec
+  sbc #7
+  tax
+  lda z_a2_table_v1, x
+  jsr z_vm_put_char
+  jsr z_reset_shift_after_emit
+  clc
+  rts
+
+z_emit_a2_v2plus:
   lda z_idx
   sec
   sbc #6
   beq z_begin_escape   ; z-char 6: start 10-bit ZSCII escape
   cmp #1
   bne z_emit_a2_table  ; z-char 7: newline
-  jsr newline
-  lda #0
-  sta z_zs_shift
+  jsr z_vm_newline
+  jsr z_reset_shift_after_emit
   clc
   rts
 z_emit_a2_table:
@@ -6255,9 +7471,8 @@ z_emit_a2_table:
   sbc #2
   tax
   lda z_a2_table, x
-  jsr print_char
-  lda #0
-  sta z_zs_shift
+  jsr z_vm_put_char
+  jsr z_reset_shift_after_emit
   clc
   rts
 
@@ -6266,6 +7481,7 @@ z_begin_escape:
   sta z_zs_escape
   lda #0
   sta z_zs_shift
+  sta z_zs_shift_once
   clc
   rts
 
@@ -6365,10 +7581,10 @@ z_emit_zscii:
   bcc z_emit_qmark
   cmp #$7F
   bcs z_emit_qmark
-  jmp print_char
+  jmp z_vm_put_char
 z_emit_qmark:
   lda #'?'
-  jmp print_char
+  jmp z_vm_put_char
 
 ; Read story byte from address in A(low), X(high). Returns A=byte, C status.
 story_read_byte_ax:
@@ -6377,6 +7593,41 @@ story_read_byte_ax:
   lda #0
   sta z_story_target+2
   jmp story_read_byte_at_target
+
+; VM output character helper (supports stream 3 memory table).
+; Input: A=character.
+z_vm_put_char:
+  ldx z_out3_active
+  beq z_vm_put_char_console
+  sta z_tmp
+  lda z_out3_ptr
+  ldx z_out3_ptr+1
+  ldy z_tmp
+  jsr z_mem_write_byte_ax
+  bcs z_vm_put_char_mem_fail
+  inc z_out3_ptr
+  bne :+
+  inc z_out3_ptr+1
+:
+  inc z_out3_len
+  bne :+
+  inc z_out3_len+1
+:
+  clc
+  rts
+z_vm_put_char_mem_fail:
+  clc
+  rts
+z_vm_put_char_console:
+  jmp print_char
+
+; VM newline helper honoring stream 3.
+z_vm_newline:
+  lda z_out3_active
+  beq :+
+  lda #$0D
+  jmp z_vm_put_char
+: jmp newline
 
 ;------------------------------------------------------------
 ; Console helper
@@ -6455,8 +7706,27 @@ msg_stream_end:
   .asciiz "End of story stream"
 msg_fat_init_fail:
   .asciiz "FAT init fail stage "
+msg_status_sep:
+  .asciiz " - "
+msg_status_score:
+  .asciiz "Score: "
+msg_status_turns:
+  .asciiz " Turns: "
+msg_status_time:
+  .asciiz "Time: "
 
-; A2 alphabet table for zchars 7..31 (zchar 6 is 10-bit ZSCII escape).
+; 8.3 short filename (11 bytes, uppercase, space-padded).
+z_save_filename:
+  .byte "ZMSAVE  SAV"
+
+; V1 A2 alphabet for zchars 7..31.
+z_a2_table_v1:
+  .byte '^'
+  .byte '0','1','2','3','4','5','6','7','8','9'
+  .byte '.',',','!','?','_','#',$27,$22,'/',$5C,'-',':','(',')'
+
+; V2+ A2 alphabet table for zchars 8..31 (zchar 6 is 10-bit ZSCII escape,
+; zchar 7 is newline).
 z_a2_table:
   .byte '0','1','2','3','4','5','6','7','8','9'
   .byte '.',',','!','?','_','#',$27,$22,'/',$5C,'-',':','(',')'

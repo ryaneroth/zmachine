@@ -73,32 +73,6 @@ Clean build outputs:
 make clean
 ```
 
-## Current Loader Flow (from `sdcard6502/src/loadfile.s`)
-
-Once loaded/executed on the KIM-1, the loader:
-
-1. Initializes VIA + SD card + FAT32
-2. Opens FAT32 root directory
-3. Presents a prompt with commands:
-   - `L` load file
-   - `H` help
-   - `E` exit
-4. Prompts for an 8.3 filename and destination address, then copies file data into memory
-
-## Current Z-Machine Bring-Up Flow (from `zmachine.s`)
-
-Once loaded/executed on the KIM-1, `zmachine` currently provides:
-
-1. Storage stack init (`VIA -> SD -> FAT32`)
-2. Prompt commands:
-   - `M` menu playable files on SD card
-   - `L` select a file from the menu by index (`1-9`, `A-F`)
-   - `B` boot selected story (parse header, set initial PC)
-   - `G` run VM loop (minimal opcode scaffold)
-   - `T` trace 32 VM steps (`PC:OP`) for opcode bring-up
-   - `H` help
-   - `E` exit
-
 The VM loop is still intentionally incomplete, but now includes:
 
 - 0OP handling for `RTRUE`, `RFALSE`, `PRINT`, `PRINT_RET`, `NEW_LINE`, `NOP`, `QUIT`

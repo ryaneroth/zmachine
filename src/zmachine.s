@@ -87,6 +87,7 @@ z_zs_shift_once      = $A8   ; v1/v2: 1 when current alphabet shift is temporary
 z_window_lines       = $A9   ; requested split height for upper window
 z_window_active      = $AA   ; 0=lower, 1=upper
 z_input_stream       = $AB   ; 0/1 selected input stream (keyboard/script)
+z_load_dot_ctr       = $AC   ; 16-bit countdown for throttled load progress dots
 z_prop_ptr           = $80   ; 16-bit property scan/data pointer
 z_prop_num           = $82   ; property number scratch
 z_prop_size          = $83   ; property size scratch
@@ -315,6 +316,12 @@ print_no_files:
   jsr dump_nonplayable_files
 
 print_menu_done:
+  jsr newline
+  ldx #<msg_menu_quit
+  ldy #>msg_menu_quit
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
   jsr fat32_openroot
   rts
 
@@ -528,6 +535,8 @@ playable_z:
   beq playable_yes
   cmp #'5'
   beq playable_yes
+  cmp #'9'
+  beq playable_yes
   cmp #'8'
   bne playable_no
 playable_yes:
@@ -619,13 +628,24 @@ select_story:
   sty z_print_ptr+1
   jsr print_string
 
-  jsr get_key_upper
-  jsr parse_menu_key_to_index
+  jsr menu_read_line
+  lda z_idx
+  bne :+
+  jmp select_invalid
+:
+  lda z_idx
+  cmp #1
+  bne :+
+  lda story_name
+  cmp #'Q'
+  beq select_quit
+:
+  jsr parse_menu_line_to_index
   bcs select_invalid
 
+  lda z_selected_index
   cmp menu_count
   bcs select_invalid
-  sta z_selected_index
 
   jsr open_selected_story
   bcs select_open_fail
@@ -642,12 +662,14 @@ select_story:
   sty z_print_ptr+1
   jsr print_string
   jsr print_buffer_name
-  ldx #<msg_ellipsis
-  ldy #>msg_ellipsis
-  stx z_print_ptr
-  sty z_print_ptr+1
-  jsr print_string
+  lda #' '
+  jsr print_char
   clc
+  rts
+
+select_quit:
+  jsr EXIT
+  sec
   rts
 
 select_invalid:
@@ -690,6 +712,143 @@ parse_key_digit:
   clc
   rts
 parse_key_fail:
+  sec
+  rts
+
+; Read one editable line into story_name, terminated by Enter.
+; - Supports backspace/delete.
+; - Converts lowercase to uppercase.
+; - Stores NUL terminator.
+; Output: z_idx = character count.
+menu_read_line:
+  lda #0
+  sta z_idx
+menu_read_loop:
+  jsr get_key
+  cmp #$0D
+  beq menu_read_done
+  cmp #$0A
+  beq menu_read_loop
+  cmp #$08
+  beq menu_read_backspace
+  cmp #$7F
+  beq menu_read_backspace
+  ; normalize lowercase to uppercase
+  cmp #'a'
+  bcc :+
+  cmp #'z'+1
+  bcs :+
+  and #$DF
+:
+  ; keep printable ASCII only
+  cmp #' '
+  bcc menu_read_loop
+  cmp #$7F
+  bcs menu_read_loop
+  ; max 5 chars (enough for decimal index + command char like Q)
+  ldy z_idx
+  cpy #5
+  bcs menu_read_loop
+  sta story_name,y
+  inc z_idx
+  jmp menu_read_loop
+
+menu_read_backspace:
+  lda z_idx
+  beq menu_read_loop
+  dec z_idx
+  jmp menu_read_loop
+
+menu_read_done:
+  ldy z_idx
+  lda #0
+  sta story_name,y
+  jsr newline
+  rts
+
+; Parse menu input line in story_name.
+; Supports:
+; - legacy single-char selection: 1..9, A..F
+; - decimal multi-digit selection: 1..65535 (range checked by caller)
+; Output: z_selected_index = 0-based index, C clear on success.
+parse_menu_line_to_index:
+  lda z_idx
+  cmp #1
+  bne parse_menu_decimal
+  lda story_name
+  jsr parse_menu_key_to_index
+  bcs parse_menu_decimal
+  sta z_selected_index
+  clc
+  rts
+
+parse_menu_decimal:
+  lda #0
+  sta z_work_ptr
+  sta z_work_ptr+1
+  ldy #0
+parse_menu_decimal_loop:
+  cpy z_idx
+  beq parse_menu_decimal_done
+  lda story_name,y
+  cmp #'0'
+  bcc parse_menu_decimal_fail
+  cmp #'9'+1
+  bcs parse_menu_decimal_fail
+  sec
+  sbc #'0'
+  pha
+  ; value = value*10 + digit
+  ; Save old value in z_tmp/z_tmp2.
+  lda z_work_ptr
+  sta z_tmp
+  lda z_work_ptr+1
+  sta z_tmp2
+  ; z_work_ptr = old*2
+  asl z_work_ptr
+  rol z_work_ptr+1
+  ; z_tmp/z_tmp2 = old*8
+  asl z_tmp
+  rol z_tmp2
+  asl z_tmp
+  rol z_tmp2
+  asl z_tmp
+  rol z_tmp2
+  ; z_work_ptr = old*10
+  clc
+  lda z_work_ptr
+  adc z_tmp
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc z_tmp2
+  sta z_work_ptr+1
+  ; add digit
+  pla
+  clc
+  adc z_work_ptr
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  iny
+  jmp parse_menu_decimal_loop
+
+parse_menu_decimal_done:
+  lda z_work_ptr
+  ora z_work_ptr+1
+  beq parse_menu_decimal_fail
+  ; convert to 0-based index in A (caller does bounds check against menu_count)
+  sec
+  lda z_work_ptr
+  sbc #1
+  sta z_selected_index
+  lda z_work_ptr+1
+  sbc #0
+  bne parse_menu_decimal_fail
+  clc
+  rts
+
+parse_menu_decimal_fail:
   sec
   rts
 
@@ -1452,6 +1611,12 @@ load_dynamic_memory:
   jsr story_rewind_open
   bcs load_dynamic_fail
 
+  ; Progress indicator: print one dot about every 1024 bytes copied.
+  lda #$00
+  sta z_load_dot_ctr
+  lda #$04
+  sta z_load_dot_ctr+1
+
   lda #<z_dynamic_base
   sta z_work_ptr
   lda #>z_dynamic_base
@@ -1487,6 +1652,23 @@ load_dynamic_loop:
   dec z_work_cnt+1
 :
   dec z_work_cnt
+
+  ; Throttled progress output while loading dynamic memory.
+  lda z_load_dot_ctr
+  bne :+
+  dec z_load_dot_ctr+1
+:
+  dec z_load_dot_ctr
+  lda z_load_dot_ctr
+  ora z_load_dot_ctr+1
+  bne :+
+  lda #'.'
+  jsr print_char
+  lda #$00
+  sta z_load_dot_ctr
+  lda #$04
+  sta z_load_dot_ctr+1
+:
   jmp load_dynamic_loop
 
 load_dynamic_done:
@@ -2295,48 +2477,48 @@ z_obj_set_child:
 
 ; Remove object A from tree.
 z_obj_remove:
-  sta z_tmp                 ; obj
+  sta z_work_cnt+1          ; obj (preserved across helper calls)
   jsr z_obj_get_parent
-  sta z_tmp2                ; parent
+  sta z_idx                 ; parent (preserved across helper calls)
   beq z_obj_remove_clear_links
 
   ; if parent.child == obj, update to obj.sibling
-  lda z_tmp2
+  lda z_idx
   jsr z_obj_get_child
-  cmp z_tmp
+  cmp z_work_cnt+1
   bne z_obj_remove_scan_siblings
-  lda z_tmp
+  lda z_work_cnt+1
   jsr z_obj_get_sibling
   tay
-  lda z_tmp2
+  lda z_idx
   jsr z_obj_set_child
   jmp z_obj_remove_clear_links
 
 z_obj_remove_scan_siblings:
-  lda z_tmp2
+  lda z_idx
   jsr z_obj_get_child
   sta z_work_cnt            ; prev
 z_obj_remove_scan_loop:
   lda z_work_cnt
   beq z_obj_remove_clear_links
   jsr z_obj_get_sibling
-  cmp z_tmp
+  cmp z_work_cnt+1
   beq z_obj_remove_patch_prev
   sta z_work_cnt
   jmp z_obj_remove_scan_loop
 
 z_obj_remove_patch_prev:
-  lda z_tmp
+  lda z_work_cnt+1
   jsr z_obj_get_sibling
   tay
   lda z_work_cnt
   jsr z_obj_set_sibling
 
 z_obj_remove_clear_links:
-  lda z_tmp
+  lda z_work_cnt+1
   ldy #0
   jsr z_obj_set_parent
-  lda z_tmp
+  lda z_work_cnt+1
   ldy #0
   jsr z_obj_set_sibling
   clc
@@ -2693,8 +2875,25 @@ z_obj_attr_write:
 :
   lda z_work_ptr
   ldx z_work_ptr+1
+  ; z_mem_read_byte_ax clobbers z_work_ptr on dynamic reads.
+  ; Preserve story-space attribute address and set/clear mode for the
+  ; subsequent write.
+  lda z_work_ptr
+  pha
+  lda z_work_ptr+1
+  pha
+  lda z_tmp2
+  pha
+  lda z_work_ptr
+  ldx z_work_ptr+1
   jsr z_mem_read_byte_ax
   sta z_idx
+  pla
+  sta z_tmp2
+  pla
+  sta z_work_ptr+1
+  pla
+  sta z_work_ptr
   lda z_tmp2
   beq z_obj_attr_do_clear
   lda z_idx
@@ -3134,6 +3333,10 @@ z_long_dispatch:
   bne :+
   jmp op_2op_compat_nop
 :
+  cmp #$1F            ; undefined/extended (compat: treat as nop)
+  bne :+
+  jmp op_2op_compat_nop
+:
   jmp zm_unknown_opcode
 
 ; Handle variable-form 2OP opcodes (C0..DF) with type byte.
@@ -3271,6 +3474,10 @@ zm_handle_var_2op:
   jmp op_2op_compat_nop
 :
   cmp #$1E            ; undefined/extended (compat: treat as nop)
+  bne :+
+  jmp op_2op_compat_nop
+:
+  cmp #$1F            ; undefined/extended (compat: treat as nop)
   bne :+
   jmp op_2op_compat_nop
 :
@@ -6152,14 +6359,20 @@ op_sread_var:
   sta z_idx                   ; count
 
 z_sread_loop:
-  lda z_idx
-  cmp z_work_cnt
-  bcs z_sread_done
   jsr get_key
   cmp #$0D
   beq z_sread_cr
   cmp #$0A
   beq z_sread_loop
+  cmp #$08
+  beq z_sread_backspace
+  cmp #$7F
+  beq z_sread_backspace
+  sta z_tmp
+  lda z_idx
+  cmp z_work_cnt
+  bcs z_sread_loop
+  lda z_tmp
   ; normalize uppercase to lowercase
   cmp #'A'
   bcc :+
@@ -6182,6 +6395,18 @@ z_sread_loop:
   ldy z_tmp
   jsr z_mem_write_byte_ax
   inc z_idx
+  jmp z_sread_loop
+
+z_sread_backspace:
+  lda z_idx
+  beq z_sread_loop
+  dec z_idx
+  lda #$08
+  jsr print_char
+  lda #' '
+  jsr print_char
+  lda #$08
+  jsr print_char
   jmp z_sread_loop
 
 z_sread_cr:
@@ -7672,12 +7897,14 @@ msg_no_files:
   .asciiz "  (no playable files found)"
 msg_debug_files:
   .asciiz "  Files seen (all non-dir):"
+msg_menu_quit:
+  .asciiz " Q ) QUIT TO MONITOR"
 msg_select:
-  .asciiz "Select file (1-9/A-F) > "
+  .asciiz "Select file > "
 msg_bad_index:
   .asciiz "Invalid menu index"
 msg_selected:
-  .asciiz "Loading: "
+  .asciiz "Loading "
 msg_ellipsis:
   .asciiz "..."
 msg_no_story:

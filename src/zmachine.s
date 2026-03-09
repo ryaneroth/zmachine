@@ -88,13 +88,18 @@ z_window_lines       = $A9   ; requested split height for upper window
 z_window_active      = $AA   ; 0=lower, 1=upper
 z_input_stream       = $AB   ; 0/1 selected input stream (keyboard/script)
 z_load_dot_ctr       = $AC   ; 16-bit countdown for throttled load progress dots
+z_call_nostore       = $AD   ; 0=call stores a result, 1=no-store call form
+z_dict_cache_enabled = $AE   ; 0=disabled, 1=enabled
+; Note: $AF = sd_read_bits (SD library scratch) — do not use.
+z_cache_slot_mask    = $46   ; runtime slot-count mask: #$07 (8-slot) or #$0F (16-slot)
+                              ; $46-$4F are free between zp_sd_currentsector ($42-$45) and z_opcount ($50)
 z_prop_ptr           = $80   ; 16-bit property scan/data pointer
 z_prop_num           = $82   ; property number scratch
 z_prop_size          = $83   ; property size scratch
 z_dictionary         = $84   ; 16-bit dictionary table address
 z_tok_start          = $86   ; token start index in input buffer
 z_tok_len            = $87   ; token length
-z_enc0               = $88   ; encoded dict key bytes (4)
+z_enc0               = $88   ; encoded dict key bytes (v1-3: 4 bytes, v4+: first 4 of 6)
 z_enc1               = $89
 z_enc2               = $8A
 z_enc3               = $8B
@@ -116,9 +121,33 @@ subdir_cluster_table = $0540 ; 8 entries * 4-byte start cluster
 fake_dirent          = $0560 ; synthetic 32-byte dirent for cluster-open
 story_name           = $0580 ; 12-byte 8.3 name buffer (must be RAM, not ROM)
 call_arg_buf         = $0590 ; 8 decoded operands (16 bytes, lo/hi pairs)
-story_cache_valid    = $05A0 ; 8-byte valid flags
-story_cache_tag_lo   = $05A8 ; 8-byte sector tag low bytes
-story_cache_tag_hi   = $05B0 ; 8-byte sector tag high bytes
+z_enc4_ram           = call_arg_buf+8  ; v4+ encoded dict byte 4
+z_enc5_ram           = call_arg_buf+9  ; v4+ encoded dict byte 5
+; Story static-sector cache: 8 or 16 direct-mapped slots (selected at boot time by
+; story_cache_configure).  Each slot holds one 512-byte story sector (2 pages).
+; Metadata arrays are 16 bytes each so the full 16-slot layout always fits here.
+story_cache_valid    = $05A0 ; 16-byte valid flags  (only [0..mask] used at runtime)
+story_cache_tag_lo   = $05B0 ; 16-byte sector tag low bytes
+story_cache_tag_hi   = $05C0 ; 16-byte sector tag high bytes
+; Dict-lookup result cache: 4 direct-mapped slots (shrunk from 8 to give story cache
+; its extra 24 bytes of metadata space).  sread is I/O-dominated, so 4 slots suffice.
+dict_cache_valid     = $05D0 ; 4-byte valid flags
+dict_cache_key0      = $05D4 ; 4-byte encoded token byte 0
+dict_cache_key1      = $05D8 ; 4-byte encoded token byte 1
+dict_cache_key2      = $05DC ; 4-byte encoded token byte 2
+dict_cache_key3      = $05E0 ; 4-byte encoded token byte 3
+dict_cache_val_lo    = $05E4 ; 4-byte dictionary result lo
+dict_cache_val_hi    = $05E8 ; 4-byte dictionary result hi
+window_cursor_row    = $05F0 ; 2-byte per-window cursor row [0]=lower,[1]=upper
+window_cursor_col    = $05F2 ; 2-byte per-window cursor column
+window_height        = $05F4 ; 2-byte per-window height in rows
+window_width         = $05F6 ; 2-byte per-window width in columns
+window_style_ram     = $05F8 ; 2-byte per-window text style bitmask
+window_font_ram      = $05FA ; 2-byte per-window font number
+window_buffer_mode   = $05FC ; 0/1 line buffering hint
+window_mouse_window  = $05FD ; selected mouse window id
+window_true_fg       = $05FE ; current true foreground colour
+window_true_bg       = $05FF ; current true background colour
 save_buffer          = $0600 ; in-RAM SAVE snapshot
 save_buffer_end      = $2000 ; exclusive end
 save_hdr_pc_lo       = save_buffer+0
@@ -922,7 +951,12 @@ story_rewind_open:
   sta z_story_pos
   sta z_story_pos+1
   sta z_story_pos+2
-  jsr story_cache_invalidate
+  ; Do NOT call story_cache_invalidate here.  The static-sector cache holds
+  ; read-only copies of story file sectors that never change; rewinding the
+  ; sequential stream does not affect cache validity.  story_cache_configure
+  ; handles boot-time invalidation and is always called after a new story is
+  ; first loaded.  Calling story_cache_invalidate here would silently disable
+  ; the cache for the rest of gameplay after every SAVE diff or RESTART.
   clc
   rts
 story_rewind_fail:
@@ -965,6 +999,12 @@ boot_story:
   jmp boot_fail
 :
   sta z_story_version
+  cmp #1
+  bcc :+
+  cmp #9
+  bcc :++
+: jmp boot_unsupported_version
+:
 
   ; Initial PC word @ 0x06
   lda #6
@@ -998,6 +1038,16 @@ boot_story:
 :
   stx z_static_base
   sta z_static_base+1
+  ; With z_dynamic_base=$2000 and interpreter code loaded at $A000,
+  ; dynamic memory must be <= $8000 bytes to avoid self-overwrite.
+  lda z_static_base+1
+  cmp #$80
+  bcc :++
+  bne :+
+  lda z_static_base
+  beq :++
+: jmp boot_dynamic_too_large
+:
 
   ; Dictionary table @ 0x08
   lda #$08
@@ -1087,6 +1137,26 @@ boot_story:
   clc
   rts
 
+boot_unsupported_version:
+  jsr newline
+  ldx #<msg_unsupported_version
+  ldy #>msg_unsupported_version
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
+  sec
+  rts
+
+boot_dynamic_too_large:
+  jsr newline
+  ldx #<msg_dynamic_too_large
+  ldy #>msg_dynamic_too_large
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
+  sec
+  rts
+
 boot_fail:
   jsr newline
   ldx #<msg_boot_fail
@@ -1141,18 +1211,31 @@ story_read_fail:
 story_cache_invalidate:
   lda #0
   sta z_cache_enabled
-  ldx #7
+  ldx #15                  ; clear all 16 slots (unused upper slots are harmless)
 :
   sta story_cache_valid,x
   dex
   bpl :-
   rts
 
+z_dict_cache_invalidate:
+  lda #1
+  sta z_dict_cache_enabled
+  lda #0
+  ldx #3                   ; 4-entry dict cache
+:
+  sta dict_cache_valid,x
+  dex
+  bpl :-
+  rts
+
 ; Configure cache placement after dynamic memory is loaded.
 ; cache_base = align_up(z_dynamic_base + z_static_base, 256)
-; cache size is 4KB (8 sectors). If no room before eval stack, disable cache.
+; Tries 16-slot first (8KB, base <= $60 so cache ends by $7FFF), then
+; 8-slot (4KB, base <= $70), then disables the cache if neither fits.
 story_cache_configure:
   jsr story_cache_invalidate
+  jsr z_dict_cache_invalidate
   lda z_static_base+1
   clc
   adc #>z_dynamic_base
@@ -1161,16 +1244,32 @@ story_cache_configure:
   beq :+
   inx
 :
-  ; Need base_hi <= $70 so [base .. base+0x0FFF] stays below $8000.
+  ; Try 16 slots: need base_hi+$20 <= $80, i.e. base_hi <= $60.
+  cpx #$61
+  bcs :+
+  stx z_cache_base_hi
+  lda #$0F
+  sta z_cache_slot_mask
+  lda #1
+  sta z_cache_enabled
+  rts
+:
+  ; Try 8 slots: need base_hi+$10 <= $80, i.e. base_hi <= $70.
   cpx #$71
   bcs :+
   stx z_cache_base_hi
+  lda #$07
+  sta z_cache_slot_mask
   lda #1
   sta z_cache_enabled
 :
   rts
 
 ; Compute story sector index (target >> 9) into z_seek_tsec_lo/hi.
+; Contract:
+; - input: z_story_target is a byte address in story space
+; - output: z_seek_tsec_lo/hi = physical 512-byte sector index within the story
+; - clobbers: A
 story_target_to_sector:
   lda z_story_target+2
   lsr
@@ -1181,7 +1280,22 @@ story_target_to_sector:
   rts
 
 ; Cached static-byte read at z_story_target.
-; Uses a direct-mapped 8-line sector cache in RAM.
+;
+; This is the generic helper for absolute static reads. It is still used by the
+; slow path in z_mem_read_byte_axy, but the common gameplay path now probes the
+; same cache inline before falling back here.
+;
+; Cache layout:
+; - direct-mapped
+; - 8 or 16 lines (selected at boot by story_cache_configure)
+; - 512 bytes per line
+; - slot = low bits of (target >> 9), masked by z_cache_slot_mask
+;
+; Contract:
+; - input: z_story_target is the absolute story-space byte address
+; - output: A=byte, C clear on success
+; - preserves: z_work_ptr on the hit path, not guaranteed on miss path
+; - clobbers: A, X, Y, z_seek_tsec_lo/hi
 story_read_byte_cached_at_target:
   lda z_cache_enabled
   bne :+
@@ -1195,7 +1309,7 @@ story_read_byte_cached_at_target:
 :
   jsr story_target_to_sector
   lda z_seek_tsec_lo
-  and #$07
+  and z_cache_slot_mask
   tax
   lda story_cache_valid,x
   beq story_cache_miss
@@ -1603,6 +1717,7 @@ z_vm_reset_stacks:
   sta z_window_lines
   sta z_window_active
   sta z_input_stream
+  sta z_call_nostore
   rts
 
 ; Copy dynamic story bytes [0 .. static_base-1] to RAM z_dynamic_base.
@@ -1683,30 +1798,166 @@ load_dynamic_fail:
   rts
 
 ; Read story byte at address AX using RAM for dynamic and SD stream for static.
-; Input: A=addr lo, X=addr hi. Output: A=byte, C clear on success.
+;
+; Contract:
+; - input: A/X = 16-bit story address
+; - output: A=byte, C clear on success
+; - always updates z_tmp/z_tmp2 with the original AX input
+;   Several callers rely on this side effect after the read returns.
+; - static reads force Y=0 before entering z_mem_read_static
+; - dynamic reads may clobber z_work_ptr
 z_mem_read_byte_ax:
+  sta z_tmp
+  stx z_tmp2
+  cpx z_static_base+1
+  bcs :+
+  jmp z_mem_read_dynamic
+:
+  bne :+
+  lda z_tmp
+  cmp z_static_base
+  bcs :+
+  jmp z_mem_read_dynamic
+:
   ldy #0
-  jmp z_mem_read_byte_axy
+  jmp z_mem_read_static
 
 ; Read story byte at address AXY (24-bit) using RAM for dynamic when ext=0.
-; Input: A=addr lo, X=addr hi, Y=addr ext. Output: A=byte, C clear on success.
+;
+; This is the main VM memory-read entry point. The control flow is:
+; 1) classify ext=0 reads as dynamic vs static using z_static_base
+; 2) for static reads, probe the inline direct-hit cache path first
+; 3) fall back to story_read_byte_cached_at_target only on cache miss / disabled cache
+;
+; Contract:
+; - input: A/X/Y = 24-bit story address
+; - output: A=byte, C clear on success
+; - updates z_tmp/z_tmp2 with the low 16 bits of the input address
+; - dynamic reads may clobber z_work_ptr
+; - static slow path preserves z_work_ptr for callers that depend on it
 z_mem_read_byte_axy:
   sta z_tmp
   stx z_tmp2
   cpy #0
-  bne z_mem_read_static_ext
+  bne z_mem_read_static_ext_entry
   ldx z_tmp2
   cpx z_static_base+1
-  bcc z_mem_read_dynamic
+  bcs :+
+  jmp z_mem_read_dynamic
+:
   bne z_mem_read_static
   lda z_tmp
   cmp z_static_base
-  bcc z_mem_read_dynamic
+  bcs :+
+  jmp z_mem_read_dynamic
+:
 
 z_mem_read_static:
+  ; Common v3/v5 path: 16-bit static address with ext byte already zero in Y.
+  ; Profiling note: this is the hottest remaining read bucket in gameplay traces.
+  ; The watch labels below are intentional and used by tools/profile_hotspots.py.
+  lda z_cache_enabled
+  beq z_mem_read_static_slow_zero
+  lda z_tmp2
+  lsr
+  sta z_seek_tsec_lo
+  and z_cache_slot_mask
+  tax
+  lda story_cache_valid,x
+  beq z_mem_read_static_slow_zero
+  lda story_cache_tag_lo,x
+  cmp z_seek_tsec_lo
+  bne z_mem_read_static_slow_zero
+  lda story_cache_tag_hi,x
+  bne z_mem_read_static_slow_zero
+z_mem_read_static_hit_zero:
+  ; For ext=0 the cache-line page is:
+  ;   z_cache_base_hi + slot*2 + ((addr_hi & 1) ? 1 : 0)
+  ; = z_cache_base_hi + (addr_hi & page_mask)
+  ; where page_mask = (slot_mask << 1) | 1  ($0F for 8-slot, $1F for 16-slot).
+  lda z_tmp
+  sta z_seek_csec_lo
+  lda z_cache_slot_mask    ; $07 or $0F
+  asl                       ; $0E or $1E
+  ora #1                    ; $0F or $1F (= page_mask)
+  and z_tmp2                ; addr_hi & page_mask
+  clc
+  adc z_cache_base_hi
+  sta z_seek_csec_hi
+  lda (z_seek_csec_lo),y
+  clc
+  rts
+
+z_mem_read_static_slow_zero:
   ldy #0
+  jmp z_mem_read_static_ext
+z_mem_read_static_ext_entry:
+  ; Separate label retained for bucket profiling.
+  jmp z_mem_read_static_ext
 z_mem_read_static_ext:
-  ; Correctness-first path: always seek/read by absolute target.
+  ; Hot path: probe the static-sector cache directly from AX/Y and only
+  ; fall back to the slower generic helper on cache miss.
+  lda z_cache_enabled
+  beq z_mem_read_static_slow
+  ; Early out-of-range check: if (Y, z_tmp2, z_tmp) >= z_story_filesize, return
+  ; 0 immediately without touching the slow path.  This saves ~35 cycles per call
+  ; for legitimately-out-of-range reads (e.g. past story end) that correctly
+  ; return 0 anyway.  Avoids ~800k slow-path round-trips on the 50-command trace.
+  tya
+  cmp z_story_filesize+2
+  bcc :+                         ; ext < filesize+2 → in range
+  bne z_mem_static_ext_oob       ; ext > filesize+2 → out of range
+  lda z_tmp2                     ; ext == filesize+2: compare mid byte
+  cmp z_story_filesize+1
+  bcc :+                         ; mid < filesize+1 → in range
+  bne z_mem_static_ext_oob       ; mid > filesize+1 → out of range
+  lda z_tmp                      ; mid == filesize+1: compare low byte
+  cmp z_story_filesize
+  bcc :+                         ; low < filesize → in range
+z_mem_static_ext_oob:
+  lda #0
+  clc
+  rts
+:
+  tya
+  lsr
+  sta z_seek_tsec_hi
+  lda z_tmp2
+  ror
+  sta z_seek_tsec_lo
+  and z_cache_slot_mask
+  tax
+  lda story_cache_valid,x
+  beq z_mem_read_static_slow
+  lda story_cache_tag_lo,x
+  cmp z_seek_tsec_lo
+  bne z_mem_read_static_slow
+  lda story_cache_tag_hi,x
+  cmp z_seek_tsec_hi
+  bne z_mem_read_static_slow
+z_mem_read_static_hit_ext:
+  ; ext!=0 path keeps the more explicit slot*512 + high-half calculation.
+  lda z_tmp
+  sta z_seek_csec_lo
+  txa
+  asl
+  clc
+  adc z_cache_base_hi
+  sta z_seek_csec_hi
+  lda z_tmp2
+  and #$01
+  beq :+
+  inc z_seek_csec_hi
+:
+  ldy #0
+  lda (z_seek_csec_lo),y
+  clc
+  rts
+
+z_mem_read_static_slow:
+  ; Slow path uses the generic absolute-target reader.
+  ; Important invariant: preserve z_work_ptr across the helper call because some
+  ; callers assume static reads do not destroy it.
   lda z_tmp
   sta z_story_target
   lda z_tmp2
@@ -1728,12 +1979,9 @@ z_mem_read_static_ext:
   tya
   rts
 
-z_mem_read_static_fail:
-  sec
-  rts
-
 z_mem_read_dynamic:
   ; pointer = z_dynamic_base + AX
+  ; Dynamic reads are RAM-only and do not touch story stream state.
   lda z_tmp
   clc
   adc #<z_dynamic_base
@@ -1956,16 +2204,16 @@ z_set_local_word:
 
 ; Call a routine using decoded operands:
 ; op1 = packed routine address, op2.. = args.
-; z_storevar must be set to destination variable, or $FF for no store.
+; z_storevar holds the destination variable id.
+; z_call_nostore is 1 for call forms that suppress the return-value store.
 z_call_common:
   lda z_op1_lo
   ora z_op1_hi
   bne z_call_nonzero
   ; Routine 0: immediately return false to store var (if any).
-  lda z_storevar
-  cmp #$FF
-  beq :+
-  tay
+  lda z_call_nostore
+  bne :+
+  ldy z_storevar
   lda #0
   tax
   jsr z_set_var_word
@@ -1993,16 +2241,12 @@ z_call_nonzero:
   lda z_op4_hi
   sta call_arg_buf+7
 
-  ; routine byte address = packed * 2
+  ; routine byte address from packed routine address (version-aware scale)
   lda z_op1_lo
-  asl
   sta z_work_ptr
   lda z_op1_hi
-  rol
   sta z_work_ptr+1
-  lda #0
-  adc #0
-  sta z_ptr_ext
+  jsr z_unpack_paddr_work
 
   ; Preserve previous frame pointer.
   lda z_fp
@@ -2055,7 +2299,32 @@ z_call_nonzero:
 :
   and #$0F
   sta z_tmp2
-  ; frame[6] = num_locals
+  ; frame[6]:
+  ; - bit7    = no-store call flag
+  ; - bits4-6 = arg count (0..7)
+  ; - bits0-3 = num_locals
+  lda z_opcount
+  beq z_call_pack_frame
+  sec
+  sbc #1
+  cmp #8
+  bcc :+
+  lda #7
+:
+  asl
+  asl
+  asl
+  asl
+z_call_pack_frame:
+  sta z_tmp
+  lda z_call_nostore
+  beq :+
+  lda z_tmp
+  ora #$80
+  sta z_tmp
+:
+  lda z_tmp
+  ora z_tmp2
   ldy #6
   sta (z_fp),y
 
@@ -2072,11 +2341,17 @@ z_call_zero_locals:
 z_call_load_defaults:
   lda #0
   sta z_idx
-  ; Advance z_work_ptr/z_ptr_ext to first local default word (routine_base + 1).
+  ; Advance z_work_ptr/z_ptr_ext to the first byte after the local-count header.
+  ; In v1-v4 this is the first local default word. In v5+ locals are always
+  ; zero-initialized, so execution starts immediately at routine_base + 1.
   jsr z_inc_work_ptr_ext
+  lda z_story_version
+  cmp #5
+  bcs z_call_apply_args
 z_call_default_loop:
   ldy #6
   lda (z_fp),y       ; num_locals from frame
+  and #$0F
   cmp z_idx
   beq z_call_apply_args
   ; Read default word at running pointer.
@@ -2133,6 +2408,7 @@ z_call_apply_args:
 :
   ldy #6
   lda (z_fp),y       ; num_locals from frame
+  and #$0F
   cmp z_idx
   bcs :+             ; num_locals >= z_idx, keep z_idx
   sta z_idx          ; cap z_idx to num_locals
@@ -2187,6 +2463,48 @@ z_call_fail:
   sec
   rts
 
+; Unpack packed address in z_work_ptr/z_work_ptr+1 into byte address.
+; Output: z_work_ptr/z_work_ptr+1/z_ptr_ext (24-bit).
+; Scale factor by version:
+;   v1-3: *2
+;   v4-7: *4
+;   v8:   *8
+z_unpack_paddr_work:
+  lda #0
+  sta z_ptr_ext
+  lda z_story_version
+  cmp #8
+  bcs z_unpack_scale8
+  cmp #4
+  bcs z_unpack_scale4
+
+z_unpack_scale2:
+  asl z_work_ptr
+  rol z_work_ptr+1
+  rol z_ptr_ext
+  rts
+
+z_unpack_scale4:
+  asl z_work_ptr
+  rol z_work_ptr+1
+  rol z_ptr_ext
+  asl z_work_ptr
+  rol z_work_ptr+1
+  rol z_ptr_ext
+  rts
+
+z_unpack_scale8:
+  asl z_work_ptr
+  rol z_work_ptr+1
+  rol z_ptr_ext
+  asl z_work_ptr
+  rol z_work_ptr+1
+  rol z_ptr_ext
+  asl z_work_ptr
+  rol z_work_ptr+1
+  rol z_ptr_ext
+  rts
+
 z_inc_work_ptr_ext:
   inc z_work_ptr
   bne :+
@@ -2227,6 +2545,9 @@ z_return_word:
   iny
   lda (z_fp),y
   sta z_storevar
+  iny
+  lda (z_fp),y
+  sta z_branch_cond
   ; pop frame
   lda z_fp
   sta z_callsp
@@ -2237,9 +2558,9 @@ z_return_word:
   lda z_work_ptr+1
   sta z_fp+1
   ; store return value unless call had no store target
+  lda z_branch_cond
+  bmi :+
   lda z_storevar
-  cmp #$FF
-  beq :+
   tay
   lda z_tmp
   ldx z_tmp2
@@ -2309,7 +2630,6 @@ z_mem_write_word_ax:
   lda z_work_cnt+1
   adc #0
   sta z_work_ptr+1
-:
   lda z_work_ptr
   ldx z_work_ptr+1
   ldy z_story_target
@@ -2323,7 +2643,9 @@ z_mem_write_word_fail:
   rts
 
 ;------------------------------------------------------------
-; Object table helpers (v3 layout)
+; Object table helpers
+; - v1-v3: 31 default-property words, 9-byte object entries
+; - v4+:   63 default-property words, 14-byte object entries
 ;------------------------------------------------------------
 ; Input A = object number (1..255). Output z_work_ptr = object entry address.
 ; C set if object is 0.
@@ -2332,25 +2654,72 @@ z_obj_addr:
   sec
   sbc #1
   sta z_tmp
-  lda z_object_table
-  clc
-  adc #62
+  lda z_story_version
+  cmp #4
+  bcc z_obj_addr_v3
+  ; v4+: offset = 126 + 14*(object-1)
+  lda z_tmp
+  asl
   sta z_work_ptr
-  lda z_object_table+1
-  adc #0
-  sta z_work_ptr+1
-  ldx z_tmp
-  beq z_obj_addr_ok
-z_obj_addr_loop:
+  lda #0
+  rol
+  sta z_work_ptr+1          ; z_work_ptr = 2*n
+  lda z_work_ptr
+  sta z_work_cnt
+  lda z_work_ptr+1
+  sta z_work_cnt+1          ; z_work_cnt = 2*n
+  ldx #6
+z_obj_addr_v4_mul_loop:
   clc
   lda z_work_ptr
-  adc #9
+  adc z_work_cnt
   sta z_work_ptr
-  bcc :+
-  inc z_work_ptr+1
-:
+  lda z_work_ptr+1
+  adc z_work_cnt+1
+  sta z_work_ptr+1
   dex
-  bne z_obj_addr_loop
+  bne z_obj_addr_v4_mul_loop
+  clc
+  lda z_work_ptr
+  adc #126
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  jmp z_obj_addr_add_base
+z_obj_addr_v3:
+  ; offset = 62 + 9*(object-1)
+  lda #0
+  sta z_work_ptr+1
+  lda z_tmp
+  asl
+  rol z_work_ptr+1
+  asl
+  rol z_work_ptr+1
+  asl
+  rol z_work_ptr+1
+  clc
+  adc z_tmp
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  clc
+  lda z_work_ptr
+  adc #62
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+z_obj_addr_add_base:
+  clc
+  lda z_work_ptr
+  adc z_object_table
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc z_object_table+1
+  sta z_work_ptr+1
+  ldx #0
 z_obj_addr_ok:
   clc
   rts
@@ -2366,6 +2735,21 @@ z_obj_get_parent:
   clc
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcc z_obj_get_parent_v3
+  clc
+  lda z_work_ptr
+  adc #7
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  lda z_tmp
+  jsr z_mem_read_byte_ax
+  clc
+  rts
+z_obj_get_parent_v3:
   clc
   lda z_work_ptr
   adc #4
@@ -2386,6 +2770,21 @@ z_obj_get_sibling:
   clc
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcc z_obj_get_sibling_v3
+  clc
+  lda z_work_ptr
+  adc #9
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  lda z_tmp
+  jsr z_mem_read_byte_ax
+  clc
+  rts
+z_obj_get_sibling_v3:
   clc
   lda z_work_ptr
   adc #5
@@ -2406,6 +2805,21 @@ z_obj_get_child:
   clc
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcc z_obj_get_child_v3
+  clc
+  lda z_work_ptr
+  adc #11
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  lda z_tmp
+  jsr z_mem_read_byte_ax
+  clc
+  rts
+z_obj_get_child_v3:
   clc
   lda z_work_ptr
   adc #6
@@ -2425,6 +2839,33 @@ z_obj_set_parent:
   clc
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcc z_obj_set_parent_v3
+  sty z_tmp2
+  clc
+  lda z_work_ptr
+  adc #6
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  ldy #0
+  lda z_tmp
+  jsr z_mem_write_byte_ax
+  clc
+  lda z_work_ptr
+  adc #7
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  ldy z_tmp2
+  lda z_tmp
+  jsr z_mem_write_byte_ax
+  clc
+  rts
+z_obj_set_parent_v3:
   clc
   lda z_work_ptr
   adc #4
@@ -2444,6 +2885,33 @@ z_obj_set_sibling:
   clc
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcc z_obj_set_sibling_v3
+  sty z_tmp2
+  clc
+  lda z_work_ptr
+  adc #8
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  ldy #0
+  lda z_tmp
+  jsr z_mem_write_byte_ax
+  clc
+  lda z_work_ptr
+  adc #9
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  ldy z_tmp2
+  lda z_tmp
+  jsr z_mem_write_byte_ax
+  clc
+  rts
+z_obj_set_sibling_v3:
   clc
   lda z_work_ptr
   adc #5
@@ -2463,6 +2931,33 @@ z_obj_set_child:
   clc
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcc z_obj_set_child_v3
+  sty z_tmp2
+  clc
+  lda z_work_ptr
+  adc #10
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  ldy #0
+  lda z_tmp
+  jsr z_mem_write_byte_ax
+  clc
+  lda z_work_ptr
+  adc #11
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  ldy z_tmp2
+  lda z_tmp
+  jsr z_mem_write_byte_ax
+  clc
+  rts
+z_obj_set_child_v3:
   clc
   lda z_work_ptr
   adc #6
@@ -2533,6 +3028,24 @@ z_obj_get_prop_table_addr:
   sec
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcc z_obj_get_prop_table_addr_v3
+  lda z_work_ptr
+  clc
+  adc #12
+  sta z_tmp
+  lda z_work_ptr+1
+  adc #0
+  tax
+  lda z_tmp
+  jsr z_mem_read_word_ax
+  bcs z_obj_get_prop_table_addr_fail
+  sta z_work_ptr
+  stx z_work_ptr+1
+  clc
+  rts
+z_obj_get_prop_table_addr_v3:
   ; Preserve object entry base on stack; z_mem_read_byte_ax clobbers z_work_ptr
   ; and z_tmp/z_tmp2 on dynamic reads.
   lda z_work_ptr
@@ -2570,23 +3083,100 @@ z_obj_get_prop_table_addr:
   tax
   lda z_tmp
   jsr z_mem_read_byte_ax
-  bcs :+
+  bcs z_obj_get_prop_table_addr_fail
   sta z_work_ptr             ; lo
   lda z_work_cnt
   sta z_work_ptr+1           ; hi
   clc
   rts
+z_obj_get_prop_table_addr_fail:
+  sec
+  rts
+
+; Decode the property header at z_prop_ptr.
+; Outputs on success (C clear):
+; - z_prop_num  = property number
+; - z_prop_size = property data length in bytes
+; - z_idx       = header length in bytes (1 or 2)
+; C set on terminator or read failure.
+z_prop_read_header:
+  lda z_prop_ptr
+  ldx z_prop_ptr+1
+  jsr z_mem_read_byte_ax
+  bcs z_prop_read_header_fail
+  beq z_prop_read_header_fail
+  sta z_tmp2
+  lda z_story_version
+  cmp #4
+  bcc z_prop_read_header_v3
+  lda z_tmp2
+  and #$3F
+  sta z_prop_num
+  lda #1
+  sta z_idx
+  lda z_tmp2
+  and #$80
+  beq z_prop_read_header_v4_short
+  clc
+  lda z_prop_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_prop_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_byte_ax
+  bcs z_prop_read_header_fail
+  and #$3F
+  bne :+
+  lda #64
 :
+  sta z_prop_size
+  lda #2
+  sta z_idx
+  clc
+  rts
+z_prop_read_header_v4_short:
+  lda z_tmp2
+  and #$40
+  beq :+
+  lda #2
+  bne :++
+:
+  lda #1
+:
+  sta z_prop_size
+  clc
+  rts
+z_prop_read_header_v3:
+  lda z_tmp2
+  and #$1F
+  sta z_prop_num
+  lda z_tmp2
+  lsr
+  lsr
+  lsr
+  lsr
+  lsr
+  clc
+  adc #1
+  sta z_prop_size
+  lda #1
+  sta z_idx
+  clc
+  rts
+z_prop_read_header_fail:
   sec
   rts
 
 ; Inputs:
 ; - z_op1_lo = object number
-; - z_op2_lo = property number (1..31)
+; - z_op2_lo = property number
 ; Outputs on found (C clear):
 ; - z_prop_ptr points to property data bytes
 ; - z_prop_num set
-; - z_prop_size set (1..8)
+; - z_prop_size set
 ; C set if not found/invalid.
 z_prop_find_object_prop:
   lda z_op1_lo
@@ -2628,23 +3218,8 @@ z_prop_find_object_prop:
   sta z_prop_ptr+1
 
 z_prop_scan_loop:
-  lda z_prop_ptr
-  ldx z_prop_ptr+1
-  jsr z_mem_read_byte_ax
+  jsr z_prop_read_header
   bcs z_prop_find_fail
-  beq z_prop_find_fail
-  sta z_tmp2
-  and #$1F
-  sta z_prop_num
-  lda z_tmp2
-  lsr
-  lsr
-  lsr
-  lsr
-  lsr
-  clc
-  adc #1
-  sta z_prop_size
   lda z_prop_num
   cmp z_op2_lo
   beq z_prop_found
@@ -2652,7 +3227,7 @@ z_prop_scan_loop:
   ; advance ptr by header + size
   clc
   lda z_prop_ptr
-  adc #1
+  adc z_idx
   adc z_prop_size
   sta z_prop_ptr
   bcc :+
@@ -2662,7 +3237,10 @@ z_prop_scan_loop:
 
 z_prop_found:
   ; move pointer from header to data
-  inc z_prop_ptr
+  clc
+  lda z_prop_ptr
+  adc z_idx
+  sta z_prop_ptr
   bne :+
   inc z_prop_ptr+1
 :
@@ -2803,8 +3381,16 @@ z_obj_attr_test:
   lda z_op2_hi
   bne z_obj_attr_test_done
   lda z_op2_lo
+  ldx z_story_version
+  cpx #4
+  bcc :+
+  cmp #48
+  bcs z_obj_attr_test_done
+  bcc :++
+:
   cmp #32
   bcs z_obj_attr_test_done
+:
   sta z_idx
   ; byte index = attr >> 3
   lsr
@@ -2849,8 +3435,16 @@ z_obj_attr_write:
   lda z_op2_hi
   bne z_obj_attr_write_done
   lda z_op2_lo
+  ldx z_story_version
+  cpx #4
+  bcc :+
+  cmp #48
+  bcs z_obj_attr_write_done
+  bcc :++
+:
   cmp #32
   bcs z_obj_attr_write_done
+:
   sta z_idx
   lsr
   lsr
@@ -3060,6 +3654,11 @@ zm_step:
 :
   cmp #$B9            ; pop
   bne :+
+  lda z_story_version
+  cmp #5
+  bcc zm_dispatch_pop_v14
+  jmp op_catch
+zm_dispatch_pop_v14:
   jmp op_pop
 :
   cmp #$BA            ; quit
@@ -3077,6 +3676,25 @@ zm_step:
   cmp #$BD            ; verify
   bne :+
   jmp op_verify
+:
+  cmp #$BE            ; extended prefix (v5+)
+  bne z_dispatch_check_piracy
+  lda z_story_version
+  cmp #5
+  bcc z_dispatch_be_unsupported
+  jmp zm_handle_ext
+z_dispatch_be_unsupported:
+  jmp zm_unknown_opcode
+
+z_dispatch_check_piracy:
+  cmp #$BF            ; piracy
+  bne :+
+  lda z_story_version
+  cmp #5
+  bcc z_dispatch_bf_unsupported
+  jmp op_piracy
+z_dispatch_bf_unsupported:
+  jmp zm_unknown_opcode
 :
   cmp #$E0            ; call (VAR form)
   bne :+
@@ -3130,6 +3748,30 @@ zm_step:
   bne :+
   jmp op_call_vs2
 :
+  cmp #$ED            ; erase_window
+  bne :+
+  jmp op_erase_window_var
+:
+  cmp #$EE            ; erase_line
+  bne :+
+  jmp op_erase_line_var
+:
+  cmp #$EF            ; set_cursor
+  bne :+
+  jmp op_set_cursor_var
+:
+  cmp #$F0            ; get_cursor
+  bne :+
+  jmp op_get_cursor_var
+:
+  cmp #$F1            ; set_text_style
+  bne :+
+  jmp op_set_text_style_var
+:
+  cmp #$F2            ; buffer_mode
+  bne :+
+  jmp op_buffer_mode_var
+:
   cmp #$F3            ; output_stream
   bne :+
   jmp op_output_stream_var
@@ -3142,6 +3784,18 @@ zm_step:
   bne :+
   jmp op_sound_effect_var
 :
+  cmp #$F6            ; read_char
+  bne :+
+  jmp op_read_char_var
+:
+  cmp #$F7            ; scan_table
+  bne :+
+  jmp op_scan_table_var
+:
+  cmp #$F8            ; not (v5+)
+  bne :+
+  jmp op_not_var
+:
   cmp #$F9            ; call_vn
   bne :+
   jmp op_call_vn
@@ -3150,8 +3804,160 @@ zm_step:
   bne :+
   jmp op_call_vn2
 :
+  cmp #$FB            ; tokenise
+  bne :+
+  jmp op_tokenise_var
+:
+  cmp #$FC            ; encode_text
+  bne :+
+  jmp op_encode_text_var
+:
+  cmp #$FD            ; copy_table
+  bne :+
+  jmp op_copy_table_var
+:
+  cmp #$FE            ; print_table
+  bne :+
+  jmp op_print_table_var
+:
+  cmp #$FF            ; check_arg_count
+  bne :+
+  jmp op_check_arg_count_var
+:
 
   jmp zm_unknown_opcode
+
+; Handle v5+ extended-form instructions (0xBE prefix).
+zm_handle_ext:
+  jsr zm_fetch_byte
+  bcc :+
+  jmp zm_stop
+:
+  sta z_opcode                  ; reuse opcode slot for ext opcode number
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda z_opcode
+  cmp #$00            ; save
+  bne :+
+  jmp op_save
+:
+  cmp #$01            ; restore
+  bne :+
+  jmp op_restore
+:
+  cmp #$02            ; log_shift
+  bne :+
+  jmp op_ext_log_shift
+:
+  cmp #$03            ; art_shift
+  bne :+
+  jmp op_ext_art_shift
+:
+  cmp #$04            ; set_font
+  bne :+
+  jmp op_ext_set_font
+:
+  cmp #$05            ; draw_picture
+  bne :+
+  jmp op_ext_draw_picture
+:
+  cmp #$06            ; picture_data
+  bne :+
+  jmp op_ext_picture_data
+:
+  cmp #$07            ; erase_picture
+  bne :+
+  jmp op_ext_erase_picture
+:
+  cmp #$08            ; set_margins
+  bne :+
+  jmp op_ext_set_margins
+:
+  cmp #$09            ; save_undo
+  bne :+
+  jmp op_ext_save_undo
+:
+  cmp #$0A            ; restore_undo
+  bne :+
+  jmp op_ext_restore_undo
+:
+  cmp #$0B            ; print_unicode
+  bne :+
+  jmp op_ext_print_unicode
+:
+  cmp #$0C            ; check_unicode
+  bne :+
+  jmp op_ext_check_unicode
+:
+  cmp #$0D            ; set_true_colour
+  bne :+
+  jmp op_ext_set_true_colour
+:
+  cmp #$10            ; move_window
+  bne :+
+  jmp op_ext_move_window
+:
+  cmp #$11            ; window_size
+  bne :+
+  jmp op_ext_window_size
+:
+  cmp #$12            ; window_style
+  bne :+
+  jmp op_ext_window_style
+:
+  cmp #$13            ; get_wind_prop
+  bne :+
+  jmp op_ext_get_wind_prop
+:
+  cmp #$14            ; scroll_window
+  bne :+
+  jmp op_ext_scroll_window
+:
+  cmp #$15            ; pop_stack
+  bne :+
+  jmp op_ext_pop_stack
+:
+  cmp #$16            ; read_mouse
+  bne :+
+  jmp op_ext_read_mouse
+:
+  cmp #$17            ; mouse_window
+  bne :+
+  jmp op_ext_mouse_window
+:
+  cmp #$18            ; push_stack
+  bne :+
+  jmp op_ext_push_stack
+:
+  cmp #$19            ; put_wind_prop
+  bne :+
+  jmp op_ext_put_wind_prop
+:
+  cmp #$1A            ; print_form
+  bne :+
+  jmp op_ext_print_form
+:
+  cmp #$1B            ; make_menu
+  bne :+
+  jmp op_ext_make_menu
+:
+  cmp #$1C            ; picture_table
+  bne :+
+  jmp op_ext_picture_table
+:
+  cmp #$1D            ; buffer_screen
+  bne :+
+  jmp op_ext_buffer_screen
+: 
+  ; Later standards specify that unknown extended opcodes >= 29 should be ignored.
+  cmp #$1D
+  bcs :+
+  jmp zm_unknown_opcode
+:
+  clc
+  rts
 
 ; Handle long-form 2OP instructions (bit7 clear, two operands).
 zm_handle_long_2op:
@@ -3317,13 +4123,13 @@ z_long_dispatch:
   bne :+
   jmp op_2op_call_2n
 :
-  cmp #$1B            ; v5+ opcode (compat: treat as nop in v3 runtime)
+  cmp #$1B            ; set_colour
   bne :+
-  jmp op_2op_compat_nop
+  jmp op_2op_set_colour
 :
-  cmp #$1C            ; v5+ opcode (compat: treat as nop in v3 runtime)
+  cmp #$1C            ; throw
   bne :+
-  jmp op_2op_compat_nop
+  jmp op_2op_throw
 :
   cmp #$1D            ; undefined in standard (compat: treat as nop)
   bne :+
@@ -3461,13 +4267,13 @@ zm_handle_var_2op:
   bne :+
   jmp op_2op_call_2n
 :
-  cmp #$1B            ; v5+ opcode (compat: treat as nop in v3 runtime)
+  cmp #$1B            ; set_colour
   bne :+
-  jmp op_2op_compat_nop
+  jmp op_2op_set_colour
 :
-  cmp #$1C            ; v5+ opcode (compat: treat as nop in v3 runtime)
+  cmp #$1C            ; throw
   bne :+
-  jmp op_2op_compat_nop
+  jmp op_2op_throw
 :
   cmp #$1D            ; undefined in standard (compat: treat as nop)
   bne :+
@@ -3946,8 +4752,9 @@ op_2op_get_next_prop:
   sta z_prop_ptr+1
   lda z_prop_ptr
   ldx z_prop_ptr+1
-  jsr z_mem_read_byte_ax
-  and #$1F
+  jsr z_prop_read_header
+  bcs op_2op_get_next_prop_zero
+  lda z_prop_num
   sta z_work_ptr
   lda #0
   sta z_work_ptr+1
@@ -3968,8 +4775,9 @@ op_2op_get_next_prop_seek_current:
 :
   lda z_prop_ptr
   ldx z_prop_ptr+1
-  jsr z_mem_read_byte_ax
-  and #$1F
+  jsr z_prop_read_header
+  bcs op_2op_get_next_prop_zero
+  lda z_prop_num
   sta z_work_ptr
   lda #0
   sta z_work_ptr+1
@@ -4115,6 +4923,8 @@ op_2op_mod:
 op_2op_call_2s:
   lda #2
   sta z_opcount
+  lda #0
+  sta z_call_nostore
   jsr zm_fetch_byte
   bcc :+
   jmp zm_stop
@@ -4125,9 +4935,93 @@ op_2op_call_2s:
 op_2op_call_2n:
   lda #2
   sta z_opcount
-  lda #$FF
-  sta z_storevar
+  lda #1
+  sta z_call_nostore
   jmp z_call_common
+
+op_2op_set_colour:
+  ; Monochrome console target: honor opcode presence but ignore colours.
+  clc
+  rts
+
+; Return the current catch token in A(low)/X(high).
+; We use a small frame-depth token so v5 code sees a stable opaque value.
+z_catch_token_current:
+  lda #0
+  sta z_work_ptr
+  sta z_work_ptr+1
+  lda z_fp
+  sta z_story_target
+  lda z_fp+1
+  sta z_story_target+1
+z_catch_token_loop:
+  lda z_story_target
+  ora z_story_target+1
+  beq z_catch_token_done
+  inc z_work_ptr
+  bne :+
+  inc z_work_ptr+1
+:
+  ldy #0
+  lda (z_story_target),y
+  pha
+  iny
+  lda (z_story_target),y
+  sta z_story_target+1
+  pla
+  sta z_story_target
+  jmp z_catch_token_loop
+z_catch_token_done:
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  rts
+
+op_2op_throw:
+  ; Unwind to the caught frame token in op2, then return op1 from that frame.
+  jsr z_catch_token_current
+  sta z_work_ptr
+  stx z_work_ptr+1
+z_throw_unwind_loop:
+  lda z_work_ptr+1
+  cmp z_op2_hi
+  bne :+
+  lda z_work_ptr
+  cmp z_op2_lo
+  beq z_throw_found
+:
+  lda z_work_ptr
+  ora z_work_ptr+1
+  bne :+
+  sec
+  rts
+:
+  ldy #0
+  lda (z_fp),y
+  sta z_story_target
+  iny
+  lda (z_fp),y
+  sta z_story_target+1
+  lda z_fp
+  sta z_callsp
+  lda z_fp+1
+  sta z_callsp+1
+  lda z_story_target
+  sta z_fp
+  lda z_story_target+1
+  sta z_fp+1
+  sec
+  lda z_work_ptr
+  sbc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  sbc #0
+  sta z_work_ptr+1
+  jmp z_throw_unwind_loop
+
+z_throw_found:
+  lda z_op1_lo
+  ldx z_op1_hi
+  jmp z_return_word
 
 ; Non-standard compatibility path:
 ; 2OP opcode number $1D is undefined in the spec. Some malformed story paths
@@ -4248,11 +5142,15 @@ zm_short_dispatch:
   bne :+
   jmp op_1op_load
 :
-  cmp #$0F            ; not
+  cmp #$0F            ; not / call_1n
   bne :+
+  lda z_story_version
+  cmp #5
+  bcc zm_dispatch_not_v14
+  jmp op_1op_call_1n
+zm_dispatch_not_v14:
   jmp op_1op_not
 :
-
   ; Unimplemented 1OP opcode
   jmp zm_unknown_opcode
 
@@ -4408,6 +5306,57 @@ op_1op_get_prop_len:
   sta z_work_ptr+1
   jmp op_1op_get_prop_len_store
 :
+  lda z_story_version
+  cmp #4
+  bcc op_1op_get_prop_len_v3
+  sec
+  lda z_op1_lo
+  sbc #1
+  sta z_work_ptr
+  lda z_op1_hi
+  sbc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_byte_ax
+  sta z_tmp2
+  and #$C0
+  bne op_1op_get_prop_len_v4_short
+  sec
+  lda z_op1_lo
+  sbc #2
+  sta z_work_ptr
+  lda z_op1_hi
+  sbc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_byte_ax
+  and #$80
+  beq op_1op_get_prop_len_v4_size1
+  lda z_tmp2
+  and #$3F
+  bne :+
+  lda #64
+:
+  sta z_work_ptr
+  lda #0
+  sta z_work_ptr+1
+  jmp op_1op_get_prop_len_store
+op_1op_get_prop_len_v4_short:
+  lda z_tmp2
+  and #$40
+  beq op_1op_get_prop_len_v4_size1
+  lda #2
+  bne op_1op_get_prop_len_store_a
+op_1op_get_prop_len_v4_size1:
+  lda #1
+op_1op_get_prop_len_store_a:
+  sta z_work_ptr
+  lda #0
+  sta z_work_ptr+1
+  jmp op_1op_get_prop_len_store
+op_1op_get_prop_len_v3:
   sec
   lda z_op1_lo
   sbc #1
@@ -4498,15 +5447,17 @@ op_1op_jump:
   rts
 
 op_1op_print_paddr:
-  ; packed address -> byte address
+  ; packed address -> byte address (version-aware scale)
   lda z_op1_lo
-  asl
-  sta z_zs_ptr
+  sta z_work_ptr
   lda z_op1_hi
-  rol
+  sta z_work_ptr+1
+  jsr z_unpack_paddr_work
+  lda z_work_ptr
+  sta z_zs_ptr
+  lda z_work_ptr+1
   sta z_zs_ptr+1
-  lda #0
-  adc #0
+  lda z_ptr_ext
   sta z_zs_ptr_ext
   jsr z_decode_zstring_at_ptr
   clc
@@ -4538,11 +5489,20 @@ op_1op_load:
 op_1op_call_1s:
   lda #1
   sta z_opcount
+  lda #0
+  sta z_call_nostore
   jsr zm_fetch_byte
   bcc :+
   jmp zm_stop
 :
   sta z_storevar
+  jmp z_call_common
+
+op_1op_call_1n:
+  lda #1
+  sta z_opcount
+  lda #1
+  sta z_call_nostore
   jmp z_call_common
 
 op_1op_not:
@@ -4993,9 +5953,125 @@ z_print_digit_emit_yes:
 z_print_digit_skip:
   rts
 
-; Encode token at text buffer (op1) using z_tok_start/z_tok_len into z_enc0..z_enc3.
-; Supports lowercase a-z directly, others map to pad char 5.
+; Encode token at text buffer (op1) using z_tok_start/z_tok_len.
+; V1-3 produce 4 bytes in z_enc0..z_enc3.
+; V4+ produce 6 bytes in z_enc0..z_enc3 + z_enc4_ram/z_enc5_ram.
+; Current encoder maps lowercase a-z directly and pads all other chars with 5.
 z_encode_token_key:
+  lda z_story_version
+  cmp #4
+  bcs :+
+  jmp z_encode_token_key_v13
+:
+
+  ldx #0
+  lda #5
+z_encode_v45_pad:
+  sta call_arg_buf,x
+  inx
+  cpx #9
+  bcc z_encode_v45_pad
+  ldx #0
+z_encode_v45_loop:
+  cpx #9
+  bcs z_encode_v45_pack
+  txa
+  cmp z_tok_len
+  bcs z_encode_v45_pack
+  stx z_idx
+  clc
+  lda z_op1_lo
+  adc z_text_base_off
+  adc z_tok_start
+  adc z_idx
+  sta z_work_ptr
+  lda z_op1_hi
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_byte_ax
+  cmp #'A'
+  bcc :+
+  cmp #'Z'+1
+  bcs :+
+  ora #$20
+:
+  cmp #'a'
+  bcc z_encode_v45_next
+  cmp #'z'+1
+  bcs z_encode_v45_next
+  sec
+  sbc #'a'-6
+  ldx z_idx
+  sta call_arg_buf,x
+z_encode_v45_next:
+  ldx z_idx
+  inx
+  jmp z_encode_v45_loop
+
+z_encode_v45_pack:
+  lda call_arg_buf+0
+  asl
+  asl
+  sta z_tmp
+  lda call_arg_buf+1
+  lsr
+  lsr
+  lsr
+  ora z_tmp
+  sta z_enc0
+  lda call_arg_buf+1
+  and #$07
+  asl
+  asl
+  asl
+  asl
+  asl
+  ora call_arg_buf+2
+  sta z_enc1
+  lda call_arg_buf+3
+  asl
+  asl
+  sta z_tmp
+  lda call_arg_buf+4
+  lsr
+  lsr
+  lsr
+  ora z_tmp
+  sta z_enc2
+  lda call_arg_buf+4
+  and #$07
+  asl
+  asl
+  asl
+  asl
+  asl
+  ora call_arg_buf+5
+  sta z_enc3
+  lda call_arg_buf+6
+  asl
+  asl
+  sta z_tmp
+  lda call_arg_buf+7
+  lsr
+  lsr
+  lsr
+  ora z_tmp
+  ora #$80
+  sta z_enc4_ram
+  lda call_arg_buf+7
+  and #$07
+  asl
+  asl
+  asl
+  asl
+  asl
+  ora call_arg_buf+8
+  sta z_enc5_ram
+  rts
+
+z_encode_token_key_v13:
   lda #5
   sta z_div_d_lo
   sta z_div_d_hi
@@ -5011,7 +6087,6 @@ z_encode_loop:
   bcs z_encode_pack
   cmp z_tok_len
   bcs z_encode_pack
-  ; read input char text[base_off + tok_start + idx]
   clc
   lda z_op1_lo
   adc z_text_base_off
@@ -5024,7 +6099,6 @@ z_encode_loop:
   lda z_work_ptr
   ldx z_work_ptr+1
   jsr z_mem_read_byte_ax
-  ; normalize uppercase to lowercase
   cmp #'A'
   bcc :+
   cmp #'Z'+1
@@ -5037,7 +6111,6 @@ z_encode_loop:
   bcs z_encode_char_done
   sec
   sbc #'a'-6
-z_encode_store_char:
   ldx z_idx
   cpx #0
   bne :+
@@ -5070,7 +6143,6 @@ z_encode_char_done:
   jmp z_encode_loop
 
 z_encode_pack:
-  ; enc0 = (z0<<2) | (z1>>3)
   lda z_div_d_lo
   asl
   asl
@@ -5081,7 +6153,6 @@ z_encode_pack:
   lsr
   ora z_tmp
   sta z_enc0
-  ; enc1 = ((z1&7)<<5) | z2
   lda z_div_d_hi
   and #$07
   asl
@@ -5091,7 +6162,6 @@ z_encode_pack:
   asl
   ora z_div_v_lo
   sta z_enc1
-  ; enc2 = 0x80 | (z3<<2) | (z4>>3)
   lda z_div_v_hi
   asl
   asl
@@ -5103,7 +6173,6 @@ z_encode_pack:
   ora z_tmp
   ora #$80
   sta z_enc2
-  ; enc3 = ((z4&7)<<5) | z5
   lda z_div_r_lo
   and #$07
   asl
@@ -5151,7 +6220,7 @@ z_dict_sep_yes:
   sec
   rts
 
-; Lookup encoded token z_enc0..z_enc3 in dictionary z_dictionary.
+; Lookup encoded token in dictionary z_dictionary.
 ; Returns dictionary entry address in z_work_ptr (0 if not found).
 z_dict_lookup_token:
   lda #0
@@ -5161,6 +6230,45 @@ z_dict_lookup_token:
   bne :+
   rts
 :
+  lda z_story_version
+  cmp #4
+  bcs z_dict_lookup_scan
+  lda z_dict_cache_enabled
+  beq z_dict_lookup_scan
+  lda z_enc0
+  eor z_enc1
+  eor z_enc2
+  eor z_enc3
+  and #$03
+  sta z_idx
+  tax
+  lda dict_cache_valid,x
+  beq z_dict_lookup_scan
+  lda dict_cache_key0,x
+  cmp z_enc0
+  bne z_dict_lookup_scan
+  lda dict_cache_key1,x
+  cmp z_enc1
+  bne z_dict_lookup_scan
+  lda dict_cache_key2,x
+  cmp z_enc2
+  bne z_dict_lookup_scan
+  lda dict_cache_key3,x
+  cmp z_enc3
+  bne z_dict_lookup_scan
+  lda dict_cache_val_lo,x
+  sta z_work_ptr
+  lda dict_cache_val_hi,x
+  sta z_work_ptr+1
+  rts
+
+z_dict_lookup_scan:
+  lda z_enc0
+  eor z_enc1
+  eor z_enc2
+  eor z_enc3
+  and #$03
+  sta z_idx
   lda z_dictionary
   sta z_prop_ptr
   lda z_dictionary+1
@@ -5202,7 +6310,22 @@ z_dict_lookup_token:
   ldx z_prop_ptr+1
   jsr z_mem_read_byte_ax
   sta z_work_cnt                ; count lo
-  ; entry pointer = ptr + 1
+  lda z_work_cnt+1
+  bpl :+
+  lda z_work_cnt
+  eor #$FF
+  sta z_work_cnt
+  lda z_work_cnt+1
+  eor #$FF
+  sta z_work_cnt+1
+  clc
+  lda z_work_cnt
+  adc #1
+  sta z_work_cnt
+  lda z_work_cnt+1
+  adc #0
+  sta z_work_cnt+1
+: ; entry pointer = ptr + 1
   inc z_prop_ptr
   bne :+
   inc z_prop_ptr+1
@@ -5210,39 +6333,80 @@ z_dict_lookup_token:
 z_dict_scan_loop:
   lda z_work_cnt
   ora z_work_cnt+1
-  beq z_dict_not_found
+  bne :+
+  jmp z_dict_not_found
+: 
   ; compare first 4 bytes
   lda z_prop_ptr
   ldx z_prop_ptr+1
   jsr z_mem_read_byte_ax
   cmp z_enc0
   bne z_dict_next
-  lda z_prop_ptr
   clc
+  lda z_prop_ptr
   adc #1
-  ldx z_prop_ptr+1
+  sta z_tmp
+  lda z_prop_ptr+1
+  adc #0
+  tax
+  lda z_tmp
   jsr z_mem_read_byte_ax
   cmp z_enc1
   bne z_dict_next
-  lda z_prop_ptr
   clc
+  lda z_prop_ptr
   adc #2
-  ldx z_prop_ptr+1
+  sta z_tmp
+  lda z_prop_ptr+1
+  adc #0
+  tax
+  lda z_tmp
   jsr z_mem_read_byte_ax
   cmp z_enc2
   bne z_dict_next
-  lda z_prop_ptr
   clc
+  lda z_prop_ptr
   adc #3
-  ldx z_prop_ptr+1
+  sta z_tmp
+  lda z_prop_ptr+1
+  adc #0
+  tax
+  lda z_tmp
   jsr z_mem_read_byte_ax
   cmp z_enc3
   bne z_dict_next
+  lda z_story_version
+  cmp #4
+  bcc z_dict_found
+  clc
+  lda z_prop_ptr
+  adc #4
+  sta z_tmp
+  lda z_prop_ptr+1
+  adc #0
+  tax
+  lda z_tmp
+  jsr z_mem_read_byte_ax
+  cmp z_enc4_ram
+  bne z_dict_next
+  clc
+  lda z_prop_ptr
+  adc #5
+  sta z_tmp
+  lda z_prop_ptr+1
+  adc #0
+  tax
+  lda z_tmp
+  jsr z_mem_read_byte_ax
+  cmp z_enc5_ram
+  bne z_dict_next
+z_dict_found:
   ; found
   lda z_prop_ptr
   sta z_work_ptr
   lda z_prop_ptr+1
   sta z_work_ptr+1
+  jsr z_dict_cache_store
   rts
 
 z_dict_next:
@@ -5264,6 +6428,31 @@ z_dict_not_found:
   lda #0
   sta z_work_ptr
   sta z_work_ptr+1
+  jsr z_dict_cache_store
+  rts
+
+z_dict_cache_store:
+  lda z_story_version
+  cmp #4
+  bcs :+
+  lda z_dict_cache_enabled
+  beq :+
+  ldx z_idx
+  lda #1
+  sta dict_cache_valid,x
+  lda z_enc0
+  sta dict_cache_key0,x
+  lda z_enc1
+  sta dict_cache_key1,x
+  lda z_enc2
+  sta dict_cache_key2,x
+  lda z_enc3
+  sta dict_cache_key3,x
+  lda z_work_ptr
+  sta dict_cache_val_lo,x
+  lda z_work_ptr+1
+  sta dict_cache_val_hi,x
+:
   rts
 
 ; Seek SD story stream to current VM PC for efficient subsequent static reads.
@@ -5790,6 +6979,12 @@ z_save_snapshot_sd_read:
   rts
 :
   jsr fat32_opendirent
+  ; libfat32 leaves zp_sd_address at readbuffer+$1E0 after open.
+  ; Force first byte read to trigger a fresh sector fetch from byte 0.
+  lda #<(fat32_readbuffer+$200)
+  sta zp_sd_address
+  lda #>(fat32_readbuffer+$200)
+  sta zp_sd_address+1
   ; Require <= 16-bit size and <= save buffer capacity.
   lda fat32_bytesremaining+2
   ora fat32_bytesremaining+3
@@ -5914,8 +7109,34 @@ op_nop:
   clc
   rts
 
+; Store A/X into the variable byte immediately following the current opcode.
+; Used by v4+ SAVE/RESTORE and several v5+ store forms.
+z_store_ax_following:
+  pha
+  txa
+  pha
+  jsr zm_fetch_byte
+  bcc :+
+  pla
+  pla
+  jmp zm_stop
+:
+  tay
+  pla
+  tax
+  pla
+  jsr z_set_var_word
+  clc
+  rts
+
 op_save:
   jsr z_save_snapshot
+  lda z_story_version
+  cmp #4
+  bcc z_save_branch
+  bcs z_save_store
+
+z_save_branch:
   bcc :+
   lda #0
   jmp z_branch_on_bool
@@ -5923,8 +7144,24 @@ op_save:
   lda #1
   jmp z_branch_on_bool
 
+z_save_store:
+  bcc :+
+  lda #0
+  tax
+  jmp z_store_ax_following
+:
+  lda #1
+  ldx #0
+  jmp z_store_ax_following
+
 op_restore:
   jsr z_restore_snapshot
+  lda z_story_version
+  cmp #4
+  bcc z_restore_branch
+  bcs z_restore_store
+
+z_restore_branch:
   bcc :+
   lda #0
   jmp z_branch_on_bool
@@ -5932,6 +7169,17 @@ op_restore:
   ; Successful restore resumes at the saved SAVE opcode's branch path.
   lda #1
   jmp z_branch_on_bool
+
+z_restore_store:
+  bcc :+
+  lda #0
+  tax
+  jmp z_store_ax_following
+:
+  ; Successful restore resumes at the saved SAVE opcode's store result.
+  lda #2
+  ldx #0
+  jmp z_store_ax_following
 
 op_restart:
   jsr boot_story
@@ -5947,10 +7195,19 @@ op_pop:
   clc
   rts
 
+op_catch:
+  jsr z_catch_token_current
+  jmp z_store_ax_following
+
 op_new_line:
   jsr z_vm_newline
   clc
   rts
+
+op_piracy:
+  ; This build has no piracy detection; always take the "legitimate copy" path.
+  lda #1
+  jmp z_branch_on_bool
 
 op_show_status:
   ; Console rendering of V3 status info:
@@ -6199,6 +7456,8 @@ zm_stop:
 op_call_vs:
   jsr zm_decode_var_operands
   bcs zm_stop
+  lda #0
+  sta z_call_nostore
   jsr zm_fetch_byte
   bcs zm_stop
   sta z_storevar
@@ -6217,6 +7476,8 @@ op_call_vs:
 op_call_vs2:
   jsr zm_decode_var_operands_2b
   bcs zm_stop
+  lda #0
+  sta z_call_nostore
   jsr zm_fetch_byte
   bcs zm_stop
   sta z_storevar
@@ -6241,8 +7502,8 @@ op_call_vn:
   clc
   rts
 :
-  lda #$FF
-  sta z_storevar
+  lda #1
+  sta z_call_nostore
   jmp z_call_common
 
 op_call_vn2:
@@ -6254,8 +7515,8 @@ op_call_vn2:
   clc
   rts
 :
-  lda #$FF
-  sta z_storevar
+  lda #1
+  sta z_call_nostore
   jmp z_call_common
 
 op_storew_var:
@@ -6401,8 +7662,9 @@ z_sread_backspace:
   lda z_idx
   beq z_sread_loop
   dec z_idx
-  lda #$08
-  jsr print_char
+  ; GETCH already echoed the BS/DEL key, moving the cursor back one.
+  ; Overwrite the character now under the cursor with a space, then
+  ; step back so the next typed character lands in the right place.
   lda #' '
   jsr print_char
   lda #$08
@@ -6475,16 +7737,37 @@ z_sread_done_text:
   bne :+
   jmp z_sread_no_parse
 :
-  ; parse_max = parse[0]
+  lda #0
+  sta z_branch_cond            ; sread always keeps unknown words
+  jsr z_tokenise_parse_buffer
+  jmp z_sread_finish_result
+
+z_sread_no_parse:
+z_sread_finish_result:
+  lda z_story_version
+  cmp #5
+  bcc :+
+  lda #13                      ; Enter terminator for aread/read
+  ldx #0
+  jmp z_store_ax_following
+: clc
+  rts
+
+; Tokenise text buffer op1 into parse buffer op2.
+; Inputs:
+; - z_idx = input length in chars
+; - z_text_base_off = text character base offset
+; - z_branch_cond = 0 to keep unknown words as zero dict entries, nonzero to skip them
+; Uses current z_dictionary for lookup.
+z_tokenise_parse_buffer:
   lda z_op2_lo
   ldx z_op2_hi
   jsr z_mem_read_byte_ax
-  sta menu_saved_count        ; parse max words
+  sta menu_saved_count
   lda #0
-  sta menu_subdir_count       ; parse word count
+  sta menu_subdir_count
   lda z_idx
-  sta menu_attr               ; preserve input length across encode/lookup
-  ; parse entry pointer = parse + 2
+  sta menu_attr
   clc
   lda z_op2_lo
   adc #2
@@ -6492,24 +7775,22 @@ z_sread_done_text:
   lda z_op2_hi
   adc #0
   sta z_prop_ptr+1
-  ; scan index
   lda #0
   sta z_tok_start
 
-z_sread_scan_next:
-  ; stop if parse full or input exhausted
+z_tokenise_scan_next:
   lda menu_subdir_count
   cmp menu_saved_count
   bcc :+
-  jmp z_sread_parse_finish
+  jmp z_tokenise_finish
 :
   lda z_tok_start
   cmp menu_attr
   bcc :+
-  jmp z_sread_parse_finish
+  jmp z_tokenise_finish
 :
 
-z_sread_skip_spaces:
+z_tokenise_skip_spaces:
   clc
   lda z_op1_lo
   adc z_text_base_off
@@ -6522,17 +7803,16 @@ z_sread_skip_spaces:
   ldx z_work_ptr+1
   jsr z_mem_read_byte_ax
   cmp #' '
-  bne z_sread_token_start_found
+  bne z_tokenise_token_start_found
   inc z_tok_start
   lda z_tok_start
   cmp menu_attr
-  bcc z_sread_skip_spaces
-  jmp z_sread_parse_finish
+  bcc z_tokenise_skip_spaces
+  jmp z_tokenise_finish
 
-z_sread_token_start_found:
+z_tokenise_token_start_found:
   lda #0
   sta z_tok_len
-  ; Dictionary separators form one-character tokens.
   clc
   lda z_op1_lo
   adc z_text_base_off
@@ -6553,16 +7833,17 @@ z_sread_token_start_found:
   sta z_prop_ptr
   lda menu_ptr+1
   sta z_prop_ptr+1
-  bcc z_sread_count_token
+  bcc z_tokenise_count_token
   lda #1
   sta z_tok_len
-  jmp z_sread_token_ready
-z_sread_count_token:
+  jmp z_tokenise_token_ready
+
+z_tokenise_count_token:
   lda z_tok_start
   clc
   adc z_tok_len
   cmp menu_attr
-  bcs z_sread_token_ready
+  bcs z_tokenise_token_ready
   sta z_tmp
   clc
   lda z_op1_lo
@@ -6576,7 +7857,7 @@ z_sread_count_token:
   ldx z_work_ptr+1
   jsr z_mem_read_byte_ax
   cmp #' '
-  beq z_sread_token_ready
+  beq z_tokenise_token_ready
   lda z_prop_ptr
   sta menu_ptr
   lda z_prop_ptr+1
@@ -6586,29 +7867,34 @@ z_sread_count_token:
   sta z_prop_ptr
   lda menu_ptr+1
   sta z_prop_ptr+1
-  bcs z_sread_token_ready
+  bcs z_tokenise_token_ready
   inc z_tok_len
-  jmp z_sread_count_token
+  jmp z_tokenise_count_token
 
-z_sread_token_ready:
-  ; Preserve parse-entry pointer across dictionary lookup (clobbers z_prop_ptr).
+z_tokenise_token_ready:
   lda z_prop_ptr
   sta menu_ptr
   lda z_prop_ptr+1
   sta menu_ptr+1
   jsr z_encode_token_key
-  jsr z_dict_lookup_token      ; dict address in z_work_ptr
+  jsr z_dict_lookup_token
   lda menu_ptr
   sta z_prop_ptr
   lda menu_ptr+1
   sta z_prop_ptr+1
-  ; write one parse entry at z_prop_ptr (big-endian dict address).
+  lda z_work_ptr
+  ora z_work_ptr+1
+  bne z_tokenise_write_entry
+  lda z_branch_cond
+  bne z_tokenise_advance_only
+
+z_tokenise_write_entry:
   lda z_work_ptr
   pha
   lda z_work_ptr+1
   pha
   pla
-  tay                          ; dict hi
+  tay
   lda z_prop_ptr
   ldx z_prop_ptr+1
   jsr z_mem_write_byte_ax
@@ -6617,7 +7903,7 @@ z_sread_token_ready:
   inc z_prop_ptr+1
 :
   pla
-  tay                          ; dict lo
+  tay
   lda z_prop_ptr
   ldx z_prop_ptr+1
   jsr z_mem_write_byte_ax
@@ -6627,7 +7913,7 @@ z_sread_token_ready:
 :
   lda z_prop_ptr
   ldx z_prop_ptr+1
-  ldy z_tok_len                ; token length
+  ldy z_tok_len
   jsr z_mem_write_byte_ax
   inc z_prop_ptr
   bne :+
@@ -6636,7 +7922,7 @@ z_sread_token_ready:
   lda z_tok_start
   clc
   adc z_text_base_off
-  tay                          ; token offset in buffer
+  tay
   lda z_prop_ptr
   ldx z_prop_ptr+1
   jsr z_mem_write_byte_ax
@@ -6644,17 +7930,16 @@ z_sread_token_ready:
   bne :+
   inc z_prop_ptr+1
 :
-  ; parse_count++
   inc menu_subdir_count
-  ; scan index += token length
+
+z_tokenise_advance_only:
   lda z_tok_start
   clc
   adc z_tok_len
   sta z_tok_start
-  jmp z_sread_scan_next
+  jmp z_tokenise_scan_next
 
-z_sread_parse_finish:
-  ; parse[1] = parse_count
+z_tokenise_finish:
   clc
   lda z_op2_lo
   adc #1
@@ -6669,9 +7954,671 @@ z_sread_parse_finish:
   clc
   rts
 
-z_sread_no_parse:
+op_tokenise_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda #2
+  sta z_text_base_off
+  clc
+  lda z_op1_lo
+  adc #1
+  sta z_work_ptr
+  lda z_op1_hi
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_byte_ax
+  sta z_idx
+  lda #0
+  sta z_branch_cond
+  lda z_opcount
+  cmp #4
+  bcc :+
+  lda z_op4_lo
+  ora z_op4_hi
+  beq :+
+  lda #1
+  sta z_branch_cond
+:
+  lda #0
+  sta z_story_target+2
+  lda z_opcount
+  cmp #3
+  bcc z_tokenise_go
+  lda z_op3_lo
+  ora z_op3_hi
+  beq z_tokenise_go
+  lda z_dictionary
+  sta z_story_target
+  lda z_dictionary+1
+  sta z_story_target+1
+  lda #1
+  sta z_story_target+2
+  lda z_op3_lo
+  sta z_dictionary
+  lda z_op3_hi
+  sta z_dictionary+1
+z_tokenise_go:
+  jsr z_tokenise_parse_buffer
+  lda z_story_target+2
+  beq :+
+  lda z_story_target
+  sta z_dictionary
+  lda z_story_target+1
+  sta z_dictionary+1
+: clc
+  rts
+
+op_encode_text_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  clc
+  lda z_op1_lo
+  adc z_op3_lo
+  sta z_op1_lo
+  lda z_op1_hi
+  adc z_op3_hi
+  sta z_op1_hi
+  lda #0
+  sta z_text_base_off
+  sta z_tok_start
+  lda z_op2_lo
+  sta z_tok_len
+  jsr z_encode_token_key
+  lda z_op4_lo
+  sta z_work_ptr
+  lda z_op4_hi
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  ldy z_enc0
+  jsr z_mem_write_byte_ax
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  ldy z_enc1
+  jsr z_mem_write_byte_ax
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  ldy z_enc2
+  jsr z_mem_write_byte_ax
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  ldy z_enc3
+  jsr z_mem_write_byte_ax
+  lda z_story_version
+  cmp #4
+  bcc :+
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  ldy z_enc4_ram
+  jsr z_mem_write_byte_ax
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  ldy z_enc5_ram
+  jsr z_mem_write_byte_ax
+: clc
+  rts
+
+op_copy_table_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda z_op3_lo
+  ora z_op3_hi
+  bne :+
   clc
   rts
+:
+  lda z_op3_lo
+  sta z_work_cnt
+  lda z_op3_hi
+  sta z_work_cnt+1
+  lda #0
+  sta z_branch_cond            ; 0=forward/zero, 1=backward
+  lda z_work_cnt+1
+  bpl :+
+  lda z_work_cnt
+  eor #$FF
+  sta z_work_cnt
+  lda z_work_cnt+1
+  eor #$FF
+  sta z_work_cnt+1
+  clc
+  lda z_work_cnt
+  adc #1
+  sta z_work_cnt
+  lda z_work_cnt+1
+  adc #0
+  sta z_work_cnt+1
+  jmp z_copy_table_forward
+:
+  lda z_op2_lo
+  ora z_op2_hi
+  beq z_copy_table_zero
+  lda z_op2_hi
+  cmp z_op1_hi
+  bcc z_copy_table_forward
+  bne :+
+  lda z_op2_lo
+  cmp z_op1_lo
+  bcc z_copy_table_forward
+: lda z_op1_lo
+  clc
+  adc z_work_cnt
+  sta z_tmp
+  lda z_op1_hi
+  adc z_work_cnt+1
+  sta z_tmp2
+  lda z_op2_hi
+  cmp z_tmp2
+  bcc z_copy_table_backward_set
+  bne z_copy_table_forward
+  lda z_op2_lo
+  cmp z_tmp
+  bcc z_copy_table_backward_set
+  beq z_copy_table_forward
+  bcs z_copy_table_forward
+z_copy_table_backward_set:
+  lda #1
+  sta z_branch_cond
+  jmp z_copy_table_backward
+
+z_copy_table_zero:
+  lda z_op1_lo
+  sta z_story_target
+  lda z_op1_hi
+  sta z_story_target+1
+z_copy_table_zero_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  bne :+
+  jmp z_copy_table_done
+: 
+  lda z_story_target
+  ldx z_story_target+1
+  ldy #0
+  jsr z_mem_write_byte_ax
+  inc z_story_target
+  bne :+
+  inc z_story_target+1
+:
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  jmp z_copy_table_zero_loop
+
+z_copy_table_forward:
+  lda z_op1_lo
+  sta z_story_target
+  lda z_op1_hi
+  sta z_story_target+1
+  lda z_op2_lo
+  sta z_work_ptr
+  lda z_op2_hi
+  sta z_work_ptr+1
+z_copy_table_forward_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_copy_table_done
+  lda z_story_target
+  ldx z_story_target+1
+  jsr z_mem_read_byte_ax
+  tay
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_write_byte_ax
+  inc z_story_target
+  bne :+
+  inc z_story_target+1
+:
+  inc z_work_ptr
+  bne :+
+  inc z_work_ptr+1
+:
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  jmp z_copy_table_forward_loop
+
+z_copy_table_backward:
+  clc
+  lda z_op1_lo
+  adc z_work_cnt
+  sta z_story_target
+  lda z_op1_hi
+  adc z_work_cnt+1
+  sta z_story_target+1
+  clc
+  lda z_op2_lo
+  adc z_work_cnt
+  sta z_work_ptr
+  lda z_op2_hi
+  adc z_work_cnt+1
+  sta z_work_ptr+1
+z_copy_table_backward_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_copy_table_done
+  sec
+  lda z_story_target
+  sbc #1
+  sta z_story_target
+  lda z_story_target+1
+  sbc #0
+  sta z_story_target+1
+  sec
+  lda z_work_ptr
+  sbc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  sbc #0
+  sta z_work_ptr+1
+  lda z_story_target
+  ldx z_story_target+1
+  jsr z_mem_read_byte_ax
+  tay
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_write_byte_ax
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  jmp z_copy_table_backward_loop
+
+z_copy_table_done:
+  clc
+  rts
+
+op_print_table_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda z_op2_lo
+  beq :+
+  lda z_op1_lo
+  sta z_work_ptr
+  lda z_op1_hi
+  sta z_work_ptr+1
+  lda #1
+  sta z_work_cnt+1            ; default height
+  lda z_opcount
+  cmp #3
+  bcc :+
+  lda z_op3_lo
+  sta z_work_cnt+1
+:
+  lda #0
+  sta z_work_cnt              ; skip
+  lda z_opcount
+  cmp #4
+  bcc :+
+  lda z_op4_lo
+  sta z_work_cnt
+:
+z_print_table_row:
+  lda z_work_cnt+1
+  beq z_print_table_done
+  lda #0
+  sta z_idx
+z_print_table_col:
+  lda z_idx
+  cmp z_op2_lo
+  beq z_print_table_row_done
+  lda z_work_ptr
+  sta z_story_target
+  lda z_work_ptr+1
+  sta z_story_target+1
+  lda z_idx
+  clc
+  adc z_story_target
+  sta z_story_target
+  lda z_story_target+1
+  adc #0
+  sta z_story_target+1
+  lda z_story_target
+  ldx z_story_target+1
+  jsr z_mem_read_byte_ax
+  jsr z_vm_put_char
+  inc z_idx
+  jmp z_print_table_col
+z_print_table_row_done:
+  jsr z_vm_newline
+  clc
+  lda z_work_ptr
+  adc z_op2_lo
+  adc z_work_cnt
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  dec z_work_cnt+1
+  lda #0
+  sta z_idx
+  jmp z_print_table_row
+z_print_table_done:
+  clc
+  rts
+
+op_ext_log_shift:
+  lda z_op2_hi
+  bmi z_ext_log_shift_right
+  lda z_op2_lo
+  sta z_work_cnt
+  lda z_op1_lo
+  sta z_work_ptr
+  lda z_op1_hi
+  sta z_work_ptr+1
+z_ext_log_shift_left_loop:
+  lda z_work_cnt
+  beq z_ext_log_shift_store
+  asl z_work_ptr
+  rol z_work_ptr+1
+  dec z_work_cnt
+  jmp z_ext_log_shift_left_loop
+z_ext_log_shift_right:
+  lda z_op2_lo
+  eor #$FF
+  clc
+  adc #1
+  sta z_work_cnt
+  lda z_op1_lo
+  sta z_work_ptr
+  lda z_op1_hi
+  sta z_work_ptr+1
+z_ext_log_shift_right_loop:
+  lda z_work_cnt
+  beq z_ext_log_shift_store
+  lsr z_work_ptr+1
+  ror z_work_ptr
+  dec z_work_cnt
+  jmp z_ext_log_shift_right_loop
+z_ext_log_shift_store:
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jmp z_store_ax_following
+
+op_ext_art_shift:
+  lda z_op2_hi
+  bmi z_ext_art_shift_right
+  lda z_op2_lo
+  sta z_work_cnt
+  lda z_op1_lo
+  sta z_work_ptr
+  lda z_op1_hi
+  sta z_work_ptr+1
+z_ext_art_shift_left_loop:
+  lda z_work_cnt
+  beq z_ext_art_shift_store
+  asl z_work_ptr
+  rol z_work_ptr+1
+  dec z_work_cnt
+  jmp z_ext_art_shift_left_loop
+z_ext_art_shift_right:
+  lda z_op2_lo
+  eor #$FF
+  clc
+  adc #1
+  sta z_work_cnt
+  lda z_op1_lo
+  sta z_work_ptr
+  lda z_op1_hi
+  sta z_work_ptr+1
+z_ext_art_shift_right_loop:
+  lda z_work_cnt
+  beq z_ext_art_shift_store
+  lda z_work_ptr+1
+  cmp #$80
+  ror z_work_ptr+1
+  ror z_work_ptr
+  dec z_work_cnt
+  jmp z_ext_art_shift_right_loop
+z_ext_art_shift_store:
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jmp z_store_ax_following
+
+op_ext_set_font:
+  lda #1
+  ldx #0
+  jmp z_store_ax_following
+
+op_ext_draw_picture:
+  clc
+  rts
+
+op_ext_picture_data:
+  lda #0
+  jmp z_branch_on_bool
+
+op_ext_erase_picture:
+  clc
+  rts
+
+op_ext_set_margins:
+  clc
+  rts
+
+op_ext_save_undo:
+  lda #0
+  tax
+  jmp z_store_ax_following
+
+op_ext_restore_undo:
+  lda #0
+  tax
+  jmp z_store_ax_following
+
+op_ext_print_unicode:
+  lda z_op1_hi
+  bne z_ext_print_unicode_q
+  lda z_op1_lo
+  cmp #13
+  beq z_ext_print_unicode_emit
+  cmp #32
+  bcc z_ext_print_unicode_q
+  cmp #127
+  bcc z_ext_print_unicode_emit
+z_ext_print_unicode_q:
+  lda #'?'
+z_ext_print_unicode_emit:
+  jsr z_vm_put_char
+  clc
+  rts
+
+op_ext_check_unicode:
+  lda #0
+  sta z_work_ptr
+  sta z_work_ptr+1
+  lda z_op1_hi
+  bne z_ext_check_unicode_store
+  lda z_op1_lo
+  cmp #13
+  beq z_ext_check_unicode_yes
+  cmp #32
+  bcc z_ext_check_unicode_store
+  cmp #127
+  bcs z_ext_check_unicode_store
+z_ext_check_unicode_yes:
+  lda #3
+  sta z_work_ptr
+z_ext_check_unicode_store:
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jmp z_store_ax_following
+
+op_ext_set_true_colour:
+  clc
+  rts
+
+op_ext_move_window:
+  clc
+  rts
+
+op_ext_window_size:
+  clc
+  rts
+
+op_ext_window_style:
+  clc
+  rts
+
+op_ext_get_wind_prop:
+  lda #0
+  tax
+  jmp z_store_ax_following
+
+op_ext_scroll_window:
+  clc
+  rts
+
+op_ext_pop_stack:
+  lda z_opcount
+  beq z_ext_pop_stack_done
+  cmp #2
+  bcc z_ext_pop_stack_eval
+  lda z_op2_lo
+  ora z_op2_hi
+  bne z_ext_pop_stack_done
+z_ext_pop_stack_eval:
+  lda z_op1_lo
+  ora z_op1_hi
+  beq z_ext_pop_stack_done
+  sta z_work_cnt
+  lda z_op1_hi
+  sta z_work_cnt+1
+z_ext_pop_stack_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_ext_pop_stack_done
+  jsr z_pop_word
+  sec
+  lda z_work_cnt
+  sbc #1
+  sta z_work_cnt
+  lda z_work_cnt+1
+  sbc #0
+  sta z_work_cnt+1
+  jmp z_ext_pop_stack_loop
+z_ext_pop_stack_done:
+  clc
+  rts
+
+op_ext_read_mouse:
+  lda z_op1_lo
+  ora z_op1_hi
+  beq z_ext_read_mouse_done
+  lda z_op1_lo
+  sta z_work_ptr
+  lda z_op1_hi
+  sta z_work_ptr+1
+  lda #6
+  sta z_idx
+z_ext_read_mouse_loop:
+  lda #0
+  ldx #0
+  jsr z_mem_write_word_ax
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  dec z_idx
+  bne z_ext_read_mouse_loop
+z_ext_read_mouse_done:
+  clc
+  rts
+
+op_ext_mouse_window:
+  clc
+  rts
+
+op_ext_push_stack:
+  lda z_opcount
+  cmp #2
+  bcc z_ext_push_stack_eval
+  lda z_op2_lo
+  ora z_op2_hi
+  bne z_ext_push_stack_fail
+z_ext_push_stack_eval:
+  lda z_op1_lo
+  ldx z_op1_hi
+  jsr z_push_word
+  lda #1
+  jmp z_branch_on_bool
+z_ext_push_stack_fail:
+  lda #0
+  jmp z_branch_on_bool
+
+op_ext_put_wind_prop:
+  clc
+  rts
+
+op_ext_print_form:
+  clc
+  rts
+
+op_ext_make_menu:
+  lda #0
+  jmp z_branch_on_bool
+
+op_ext_picture_table:
+  clc
+  rts
+
+op_ext_buffer_screen:
+  lda #0
+  tax
+  jmp z_store_ax_following
 
 op_print_char_var:
   jsr zm_decode_var_operands
@@ -6812,8 +8759,14 @@ op_pull_var:
   jmp zm_stop
 :
   lda z_op1_raw
-  tay
+  pha
   jsr z_pop_word
+  sta z_work_ptr
+  stx z_work_ptr+1
+  pla
+  tay
+  lda z_work_ptr
+  ldx z_work_ptr+1
   jsr z_set_var_word
   clc
   rts
@@ -6851,6 +8804,73 @@ op_set_window_var:
   clc
   rts
 
+op_erase_window_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  ; No screen buffer to clear; treat as a supported no-op.
+  clc
+  rts
+
+op_erase_line_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  clc
+  rts
+
+op_set_cursor_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  clc
+  rts
+
+op_get_cursor_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda z_op1_lo
+  sta z_work_ptr
+  lda z_op1_hi
+  sta z_work_ptr+1
+  lda #1
+  ldx #0
+  jsr z_mem_write_word_ax
+  bcs :+
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  lda #1
+  ldx #0
+  jsr z_mem_write_word_ax
+: clc
+  rts
+
+op_set_text_style_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  clc
+  rts
+
+op_buffer_mode_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  clc
+  rts
+
 op_input_stream_var:
   jsr zm_decode_var_operands
   bcc :+
@@ -6874,6 +8894,170 @@ op_sound_effect_var:
   ; No sound hardware support.
   clc
   rts
+
+op_read_char_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+z_read_char_wait:
+  jsr get_key
+  cmp #$0A
+  beq z_read_char_wait
+  cmp #$0D
+  bne :+
+  lda #13
+  ldx #0
+  jmp z_store_ax_following
+:
+  ldx #0
+  jmp z_store_ax_following
+
+op_scan_table_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda z_op4_lo
+  bne :+
+  lda #$82                     ; default: word compare, entry len 2
+  sta z_op4_lo
+:
+  lda z_op4_lo
+  and #$7F
+  sta z_work_cnt               ; entry length
+  lda z_op4_lo
+  and #$80
+  sta z_work_cnt+1             ; nonzero => word compare
+  lda z_op2_lo
+  sta z_work_ptr
+  lda z_op2_hi
+  sta z_work_ptr+1
+z_scan_table_loop:
+  lda z_op3_lo
+  ora z_op3_hi
+  beq z_scan_table_not_found
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  jsr z_mem_read_byte_ax
+  sta z_tmp
+  lda z_work_cnt+1
+  beq z_scan_table_compare_byte
+  clc
+  lda z_work_ptr
+  adc #1
+  sta z_story_target
+  lda z_work_ptr+1
+  adc #0
+  sta z_story_target+1
+  lda z_story_target
+  ldx z_story_target+1
+  jsr z_mem_read_byte_ax
+  cmp z_op1_lo
+  bne z_scan_table_next
+  lda z_tmp
+  cmp z_op1_hi
+  bne z_scan_table_next
+  jmp z_scan_table_found
+z_scan_table_compare_byte:
+  lda z_tmp
+  cmp z_op1_lo
+  beq z_scan_table_found
+z_scan_table_next:
+  clc
+  lda z_work_ptr
+  adc z_work_cnt
+  sta z_work_ptr
+  lda z_work_ptr+1
+  adc #0
+  sta z_work_ptr+1
+  sec
+  lda z_op3_lo
+  sbc #1
+  sta z_op3_lo
+  lda z_op3_hi
+  sbc #0
+  sta z_op3_hi
+  jmp z_scan_table_loop
+z_scan_table_found:
+  lda z_work_ptr
+  pha
+  lda z_work_ptr+1
+  pha
+  jsr zm_fetch_byte
+  bcc :+
+  pla
+  pla
+  jmp zm_stop
+:
+  tay
+  pla
+  tax
+  pla
+  jsr z_set_var_word
+  lda #1
+  jmp z_branch_on_bool
+z_scan_table_not_found:
+  lda #0
+  pha
+  pha
+  jsr zm_fetch_byte
+  bcc :+
+  pla
+  pla
+  jmp zm_stop
+:
+  tay
+  pla
+  tax
+  pla
+  jsr z_set_var_word
+  lda #0
+  jmp z_branch_on_bool
+
+op_not_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda z_op1_hi
+  eor #$FF
+  tax
+  lda z_op1_lo
+  eor #$FF
+  jmp z_store_ax_following
+
+op_check_arg_count_var:
+  jsr zm_decode_var_operands
+  bcc :+
+  jmp zm_stop
+:
+  lda z_fp
+  ora z_fp+1
+  bne :+
+  lda #0
+  jmp z_branch_on_bool
+:
+  lda z_op1_hi
+  bne z_check_arg_count_false
+  lda z_op1_lo
+  beq z_check_arg_count_false
+  sta z_tmp
+  ldy #6
+  lda (z_fp),y
+  lsr
+  lsr
+  lsr
+  lsr
+  and #$07
+  cmp z_tmp
+  bcs z_check_arg_count_true
+z_check_arg_count_false:
+  lda #0
+  jmp z_branch_on_bool
+z_check_arg_count_true:
+  lda #1
+  jmp z_branch_on_bool
 
 op_output_stream_var:
   jsr zm_decode_var_operands
@@ -7915,6 +10099,10 @@ msg_boot_ok:
   .asciiz "Boot ok, version/PC: "
 msg_boot_fail:
   .asciiz "Story boot failed"
+msg_unsupported_version:
+  .asciiz "Unsupported story version"
+msg_dynamic_too_large:
+  .asciiz "Story dynamic memory too large for this build"
 msg_vm_run:
   .asciiz "Running VM"
 msg_trace:

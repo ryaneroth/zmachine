@@ -87,7 +87,7 @@ The VM loop is still intentionally incomplete, but now includes:
 - VAR utility ops (`STOREW`, `STOREB`, `PUT_PROP`, `SREAD` with multi-token parse-buffer output + dictionary lookup, `PRINT_CHAR`, `PRINT_NUM`, `RANDOM`, `PUSH`, `PULL`)
 - 32-step trace mode (`T`) to accelerate opcode bring-up (`PC:OP`)
 
-**Important current limitation**: Only a subset of instruction forms/opcodes are implemented; full branch/store/object/property semantics are still in progress.
+**Important current limitation**: The standard opcode tables are now mapped, but later-version window/picture/mouse/menu/user-stack behavior is still compatibility-only on this hardware target.
 
 ## Notes
 

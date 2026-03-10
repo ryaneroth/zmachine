@@ -93,6 +93,13 @@ z_dict_cache_enabled = $AE   ; 0=disabled, 1=enabled
 ; Note: $AF = sd_read_bits (SD library scratch) — do not use.
 z_cache_slot_mask    = $46   ; runtime slot-count mask: #$07 (8-slot) or #$0F (16-slot)
                               ; $46-$4F are free between zp_sd_currentsector ($42-$45) and z_opcount ($50)
+z_timed_tenths       = $47   ; remaining 1/10s in timed input (0 = no timeout active)
+z_timed_rtn_lo       = $48   ; packed timed callback routine address lo
+z_timed_rtn_hi       = $49   ; packed timed callback routine address hi
+z_timed_reset_val    = $4A   ; original tenths count (for restart after false callback)
+z_sread_callsp_lo    = $4B   ; saved z_callsp lo during timed callback mini-loop
+z_sread_callsp_hi    = $4C   ; saved z_callsp hi during timed callback mini-loop
+                              ; $4D-$4F free
 z_prop_ptr           = $80   ; 16-bit property scan/data pointer
 z_prop_num           = $82   ; property number scratch
 z_prop_size          = $83   ; property size scratch
@@ -171,6 +178,16 @@ save_data_base       = save_buffer+17
 z_dynamic_base       = $2000 ; dynamic story bytes (0 .. static_base-1)
 z_eval_stack_base    = $8000 ; eval stack
 z_call_stack_base    = $8800 ; call frame stack
+
+; RIOT 6530-003 timer (base $1700).  Writing to $1707 arms the 8-bit countdown
+; with a /1024 clock divider.  Reading $1708 returns status: bit 7 = underflow
+; since last read (cleared on read).  Emulator-only: on real KIM-1 hardware
+; GETCH blocks forever so the polling path in z_timed_get_char never executes
+; and timed input degrades gracefully to no-op.
+; At 1 MHz: TIMED_INPUT_COUNT x 1024 = 100352 cycles ≈ 100 ms (1/10 s).
+RIOT_003_TIMER_WR_1024 = $1707
+RIOT_003_TIMER_STATUS  = $1708
+TIMED_INPUT_COUNT      = 98
 
 .org $A000
 
@@ -6914,17 +6931,40 @@ z_save_snapshot_size:
   ldx z_work_cnt+1
   rts
 
+; Build the per-story save filename in z_save_filename_buf.
+; Takes the 8-byte name field from story_name (FAT32 8.3 format, space-padded)
+; and appends "SAV" as the extension.  E.g. "ZORK1   DAT" -> "ZORK1   SAV".
+; Called at the start of every SAVE/RESTORE operation.
+build_save_filename:
+  ldx #0
+:
+  cpx #8
+  beq :+
+  lda story_name,x
+  sta z_save_filename_buf,x
+  inx
+  bne :-
+:
+  lda #'S'
+  sta z_save_filename_buf+8
+  lda #'A'
+  sta z_save_filename_buf+9
+  lda #'V'
+  sta z_save_filename_buf+10
+  rts
+
 ; Persist current save_buffer snapshot to SD card save file.
 ; C clear on success.
 z_save_snapshot_sd_write:
+  jsr build_save_filename
   jsr z_save_snapshot_size
   ; Keep size in z_div_q while FAT32 APIs clobber counters.
   sta z_div_q_lo
   stx z_div_q_hi
   ; Remove previous save file if present.
   jsr fat32_openroot
-  ldx #<z_save_filename
-  ldy #>z_save_filename
+  ldx #<z_save_filename_buf
+  ldy #>z_save_filename_buf
   jsr fat32_finddirent
   bcs :+
   jsr fat32_deletefile
@@ -6941,9 +6981,9 @@ z_save_snapshot_sd_write:
 :
   ; Create root dir entry with the allocated cluster chain.
   jsr fat32_openroot
-  lda #<z_save_filename
+  lda #<z_save_filename_buf
   sta fat32_filenamepointer
-  lda #>z_save_filename
+  lda #>z_save_filename_buf
   sta fat32_filenamepointer+1
   lda z_div_q_lo
   sta fat32_bytesremaining
@@ -6970,9 +7010,10 @@ z_save_snapshot_sd_write:
 ; Load snapshot bytes from SD save file into save_buffer.
 ; C clear on success.
 z_save_snapshot_sd_read:
+  jsr build_save_filename
   jsr fat32_openroot
-  ldx #<z_save_filename
-  ldy #>z_save_filename
+  ldx #<z_save_filename_buf
+  ldy #>z_save_filename_buf
   jsr fat32_finddirent
   bcc :+
   sec
@@ -7217,6 +7258,12 @@ op_show_status:
   lda #0
   sta z_out3_active
   jsr newline
+  ldx #<msg_status_bar
+  ldy #>msg_status_bar
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
+  jsr newline
   ldy #0
   jsr z_status_get_global_word
   jsr z_print_obj_name
@@ -7309,6 +7356,12 @@ z_show_status_time_hour:
   jsr print_char
 
 z_show_status_done:
+  jsr newline
+  ldx #<msg_status_bar
+  ldy #>msg_status_bar
+  stx z_print_ptr
+  sty z_print_ptr+1
+  jsr print_string
   jsr newline
   pla
   sta z_out3_active
@@ -7618,9 +7671,31 @@ op_sread_var:
 :
   lda #0
   sta z_idx                   ; count
+  ; Timed input: v5+ sread op3=time(1/10 s), op4=routine (0=timeout only).
+  sta z_timed_tenths          ; default: no timeout
+  lda z_story_version
+  cmp #5
+  bcc z_sread_no_timeout      ; v1-v4: timed input not defined
+  lda z_opcount
+  cmp #3
+  bcc z_sread_no_timeout      ; op3 omitted: no timeout
+  lda z_op3_lo                ; op3 = time in 1/10 s units
+  beq z_sread_no_timeout      ; 0 = no timeout
+  sta z_timed_tenths
+  sta z_timed_reset_val       ; keep original for restart after false callback
+  lda z_op4_lo
+  sta z_timed_rtn_lo          ; op4 = packed routine addr (0 = timeout only)
+  lda z_op4_hi
+  sta z_timed_rtn_hi
+  lda #TIMED_INPUT_COUNT
+  sta RIOT_003_TIMER_WR_1024  ; arm the RIOT /1024 timer
+z_sread_no_timeout:
 
 z_sread_loop:
-  jsr get_key
+  jsr z_timed_get_char
+  bne :+
+  jmp z_sread_timeout         ; A=0 → timeout fired, callback said abort
+:
   cmp #$0D
   beq z_sread_cr
   cmp #$0A
@@ -7751,6 +7826,163 @@ z_sread_finish_result:
   ldx #0
   jmp z_store_ax_following
 : clc
+  rts
+
+; Timed-input timeout: callback returned true (or no routine, tenths hit 0).
+; v5+: write count=0 to text+1, skip parse, store 0 as terminator.
+; v1-v4: timed input not spec'd; just return cleanly with no parse.
+z_sread_timeout:
+  jsr newline
+  lda z_story_version
+  cmp #5
+  bcc :+
+  ; Store count=0 into text buffer byte 1.
+  clc
+  lda z_op1_lo
+  adc #1
+  sta z_work_ptr
+  lda z_op1_hi
+  adc #0
+  sta z_work_ptr+1
+  lda z_work_ptr
+  ldx z_work_ptr+1
+  ldy #0
+  jsr z_mem_write_byte_ax
+  lda #0
+  ldx #0
+  jmp z_store_ax_following    ; store 0 = timeout terminator
+: clc
+  rts
+
+;--------------------------------------------------------------
+; z_timed_get_char -- poll for input, checking RIOT timer when
+;   z_timed_tenths > 0.  When tenths expire: invokes callback
+;   routine (if any) or signals timeout unconditionally.
+;
+; Returns: A = received key (nonzero), or A = 0 to abort input.
+; Clobbers: A, X, Y and all scratch used by z_timed_invoke_callback.
+;--------------------------------------------------------------
+z_timed_get_char:
+  lda z_timed_tenths
+  bne :+
+  jmp get_key                 ; no timeout: tail-call blocking read
+:
+z_tgc_poll:
+  jsr get_input               ; emulator: returns 0x00 when no key queued
+  and #$7F
+  bne z_tgc_done              ; got a key -> return it
+  ; No key: check RIOT timer status (bit 7 = underflow, cleared on read).
+  lda RIOT_003_TIMER_STATUS
+  bpl z_tgc_poll              ; bit 7 clear -> still counting, keep polling
+  ; Timer underflowed: consume one tenth.
+  dec z_timed_tenths
+  bne z_tgc_rearm             ; still tenths left -> re-arm and keep polling
+  ; All tenths exhausted: invoke callback or signal unconditional timeout.
+  lda z_timed_rtn_lo
+  ora z_timed_rtn_hi
+  beq z_tgc_timeout           ; no routine -> abort
+  jsr z_timed_invoke_callback ; A=0 false / nonzero true
+  bne z_tgc_timeout           ; true -> abort sread
+  ; Callback returned false: restart the full original timeout.
+  lda z_timed_reset_val
+  sta z_timed_tenths
+z_tgc_rearm:
+  lda #TIMED_INPUT_COUNT
+  sta RIOT_003_TIMER_WR_1024  ; re-arm timer
+  jmp z_tgc_poll
+z_tgc_timeout:
+  lda #0                      ; signal abort
+  rts
+z_tgc_done:
+  rts
+
+;--------------------------------------------------------------
+; z_timed_invoke_callback -- call Z-machine routine at
+;   z_timed_rtn_lo/hi (packed), run it to completion, return
+;   its result in A (0=false, nonzero=true).
+;
+; Saves and restores all sread-critical ZP state.
+; Uses z_sread_callsp_lo/hi to detect when the callback returns.
+;--------------------------------------------------------------
+z_timed_invoke_callback:
+  ; Push sread state onto the native stack (popped in reverse on return).
+  lda z_text_base_off
+  pha
+  lda z_opcount
+  pha
+  lda z_work_cnt
+  pha
+  lda z_idx
+  pha
+  lda z_op1_lo
+  pha
+  lda z_op1_hi
+  pha
+  lda z_op2_lo
+  pha
+  lda z_op2_hi
+  pha
+  ; Record call stack depth: callback has returned when callsp equals this.
+  lda z_callsp
+  sta z_sread_callsp_lo
+  lda z_callsp+1
+  sta z_sread_callsp_hi
+  ; Set up operand registers for a 0-arg call; result stored to var 0 (eval stack).
+  lda z_timed_rtn_lo
+  sta z_op1_lo
+  lda z_timed_rtn_hi
+  sta z_op1_hi
+  lda #0
+  sta z_op2_lo
+  sta z_op2_hi
+  sta z_op3_lo
+  sta z_op3_hi
+  sta z_op4_lo
+  sta z_op4_hi
+  lda #1
+  sta z_opcount               ; opcount=1: only the routine address operand
+  lda #0
+  sta z_call_nostore          ; store the return value
+  sta z_storevar              ; var 0 = push to eval stack
+  jsr z_call_common           ; push call frame, redirect PC to callback
+  ; Mini interpreter: run opcodes until callsp drops back to saved level.
+z_tic_loop:
+  lda z_callsp
+  cmp z_sread_callsp_lo
+  bne z_tic_step
+  lda z_callsp+1
+  cmp z_sread_callsp_hi
+  beq z_tic_returned          ; callsp restored -> callback has returned
+z_tic_step:
+  jsr zm_step
+  bcc z_tic_loop
+  ; Fatal VM error during callback: treat as true (abort input).
+  lda #1
+  sta z_tmp2
+  jmp z_tic_restore
+z_tic_returned:
+  ; Pop the callback's return value off the Z-machine eval stack.
+  jsr z_pop_word              ; A=lo byte of result, X=hi
+  sta z_tmp2                  ; save result
+z_tic_restore:
+  ; Restore sread state from native stack (reverse of push order above).
+  pla
+  sta z_op2_hi
+  pla
+  sta z_op2_lo
+  pla
+  sta z_op1_hi
+  pla
+  sta z_op1_lo
+  pla
+  sta z_idx
+  pla
+  sta z_work_cnt
+  pla
+  sta z_opcount
+  pla
+  sta z_text_base_off
+  lda z_tmp2
   rts
 
 ; Tokenise text buffer op1 into parse buffer op2.
@@ -8900,16 +9132,56 @@ op_read_char_var:
   bcc :+
   jmp zm_stop
 :
-z_read_char_wait:
-  jsr get_key
+  ; Timed input: op2=time(1/10 s), op3=routine (0=timeout only).
+  lda #0
+  sta z_timed_tenths          ; default: no timeout
+  lda z_opcount
+  cmp #2
+  bcc z_rdc_no_timeout        ; op2 omitted: no timeout
+  lda z_op2_lo                ; op2 = time in 1/10 s units
+  beq z_rdc_no_timeout        ; 0 = no timeout
+  sta z_timed_tenths
+  sta z_timed_reset_val
+  lda z_op3_lo
+  sta z_timed_rtn_lo          ; op3 = packed routine addr
+  lda z_op3_hi
+  sta z_timed_rtn_hi
+  lda #TIMED_INPUT_COUNT
+  sta RIOT_003_TIMER_WR_1024
+z_rdc_no_timeout:
+z_rdc_poll:
+  jsr z_timed_get_char
+  beq z_rdc_timeout           ; A=0 → timeout, store 0
   cmp #$0A
-  beq z_read_char_wait
+  beq z_rdc_poll              ; skip LF
   cmp #$0D
-  bne :+
+  beq z_read_char_enter       ; Enter → ZSCII 13
+  cmp #$08
+  beq z_read_char_store       ; BS → ZSCII 8 (GETCH already moved cursor back)
+  cmp #$7F
+  beq z_read_char_del         ; DEL → ZSCII 8
+  ; Printable char: suppress the GETCH echo with BS+space+BS.
+  pha
+  lda #$08
+  jsr print_char
+  lda #' '
+  jsr print_char
+  lda #$08
+  jsr print_char
+  pla
+z_read_char_store:
+  ldx #0
+  jmp z_store_ax_following
+z_read_char_enter:
   lda #13
   ldx #0
   jmp z_store_ax_following
-:
+z_read_char_del:
+  lda #8
+  ldx #0
+  jmp z_store_ax_following
+z_rdc_timeout:
+  lda #0
   ldx #0
   jmp z_store_ax_following
 
@@ -10121,6 +10393,8 @@ msg_stream_end:
   .asciiz "End of story stream"
 msg_fat_init_fail:
   .asciiz "FAT init fail stage "
+msg_status_bar:
+  .asciiz "----------------------------------------"
 msg_status_sep:
   .asciiz " - "
 msg_status_score:
@@ -10130,9 +10404,10 @@ msg_status_turns:
 msg_status_time:
   .asciiz "Time: "
 
-; 8.3 short filename (11 bytes, uppercase, space-padded).
-z_save_filename:
-  .byte "ZMSAVE  SAV"
+; Save filename buffer (11 bytes): built at runtime from story_name by
+; build_save_filename.  Lives in call_arg_buf ($0590) which is idle during
+; 0OP SAVE/RESTORE execution (no operand decode in flight at that point).
+z_save_filename_buf = call_arg_buf
 
 ; V1 A2 alphabet for zchars 7..31.
 z_a2_table_v1:

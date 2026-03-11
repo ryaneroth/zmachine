@@ -99,7 +99,8 @@ z_timed_rtn_hi       = $49   ; packed timed callback routine address hi
 z_timed_reset_val    = $4A   ; original tenths count (for restart after false callback)
 z_sread_callsp_lo    = $4B   ; saved z_callsp lo during timed callback mini-loop
 z_sread_callsp_hi    = $4C   ; saved z_callsp hi during timed callback mini-loop
-                              ; $4D-$4F free
+z_script_pos         = $4D   ; current script-input byte offset
+z_last_input_script  = $4F   ; 0=keyboard, 1=script file
 z_prop_ptr           = $80   ; 16-bit property scan/data pointer
 z_prop_num           = $82   ; property number scratch
 z_prop_size          = $83   ; property size scratch
@@ -178,6 +179,12 @@ save_data_base       = save_buffer+17
 z_dynamic_base       = $2000 ; dynamic story bytes (0 .. static_base-1)
 z_eval_stack_base    = $8000 ; eval stack
 z_call_stack_base    = $8800 ; call frame stack
+transcript_buffer    = $9000 ; buffered transcript output (4 KB cap)
+transcript_buffer_end = $A000
+z_out2_len_ram       = menu_buffer
+z_out2_trunc_ram     = menu_buffer+2
+z_out2_active        = menu_buffer+3
+z_stream_filename_buf = menu_buffer+4
 
 ; RIOT 6530-003 timer (base $1700).  Writing to $1707 arms the 8-bit countdown
 ; with a /1024 clock divider.  Reading $1708 returns status: bit 7 = underflow
@@ -259,9 +266,22 @@ init_storage:
 ; Input helpers
 ;------------------------------------------------------------
 get_key:
+  lda z_input_stream
+  beq get_key_kbd
+  jsr z_script_read_char
+  bcc :+
+  lda #0
+  sta z_input_stream
+get_key_kbd:
+  lda #0
+  sta z_last_input_script
   jsr get_input
   and #$7F
   beq get_key
+  rts
+:
+  lda #1
+  sta z_last_input_script
   rts
 
 get_key_upper:
@@ -1723,6 +1743,7 @@ z_vm_reset_stacks:
   lda #$00
   sta z_rng_state_hi
   sta z_save_valid
+  sta z_out2_active
   sta z_out3_active
   sta z_out3_ptr
   sta z_out3_ptr+1
@@ -1734,7 +1755,13 @@ z_vm_reset_stacks:
   sta z_window_lines
   sta z_window_active
   sta z_input_stream
+  sta z_script_pos
+  sta z_script_pos+1
+  sta z_last_input_script
   sta z_call_nostore
+  sta z_out2_len_ram
+  sta z_out2_len_ram+1
+  sta z_out2_trunc_ram
   rts
 
 ; Copy dynamic story bytes [0 .. static_base-1] to RAM z_dynamic_base.
@@ -2166,7 +2193,7 @@ z_get_local_word:
   sta z_work_ptr+1
   clc
   lda z_fp
-  adc #7
+  adc #9
   adc z_work_ptr
   sta z_work_ptr
   lda z_fp+1
@@ -2204,7 +2231,7 @@ z_set_local_word:
   sta z_work_ptr+1
   clc
   lda z_fp
-  adc #7
+  adc #9
   adc z_work_ptr
   sta z_work_ptr
   lda z_fp+1
@@ -2271,14 +2298,16 @@ z_call_nonzero:
   lda z_fp+1
   sta z_story_target+1
 
-  ; Create fixed-size frame (37 bytes).
+  ; Create fixed-size frame (39 bytes):
+  ; [0..1] prev fp, [2..4] return pc, [5] store var,
+  ; [6..7] caller eval-stack depth, [8] flags/local count, [9..38] locals.
   lda z_callsp
   sta z_fp
   lda z_callsp+1
   sta z_fp+1
   clc
   lda z_callsp
-  adc #37
+  adc #39
   sta z_callsp
   bcc :+
   inc z_callsp+1
@@ -2305,6 +2334,13 @@ z_call_nonzero:
   iny
   lda z_storevar
   sta (z_fp),y
+  ; frame[6..7] = caller eval stack pointer
+  iny
+  lda z_sp
+  sta (z_fp),y
+  iny
+  lda z_sp+1
+  sta (z_fp),y
 
   ; Read num_locals at routine start.
   lda z_work_ptr
@@ -2316,7 +2352,7 @@ z_call_nonzero:
 :
   and #$0F
   sta z_tmp2
-  ; frame[6]:
+  ; frame[8]:
   ; - bit7    = no-store call flag
   ; - bits4-6 = arg count (0..7)
   ; - bits0-3 = num_locals
@@ -2342,14 +2378,14 @@ z_call_pack_frame:
 :
   lda z_tmp
   ora z_tmp2
-  ldy #6
+  ldy #8
   sta (z_fp),y
 
-  ; Zero-initialize local slots [7..36]
-  ldy #7
+  ; Zero-initialize local slots [9..38]
+  ldy #9
   lda #0
 z_call_zero_locals:
-  cpy #37
+  cpy #39
   beq z_call_load_defaults
   sta (z_fp),y
   iny
@@ -2366,7 +2402,7 @@ z_call_load_defaults:
   cmp #5
   bcs z_call_apply_args
 z_call_default_loop:
-  ldy #6
+  ldy #8
   lda (z_fp),y       ; num_locals from frame
   and #$0F
   cmp z_idx
@@ -2394,13 +2430,13 @@ z_call_default_loop:
   tax
   lda z_tmp
   jsr z_inc_work_ptr_ext
-  ; Store A=lo, X=hi into frame slot [7 + z_idx*2].
+  ; Store A=lo, X=hi into frame slot [9 + z_idx*2].
   ; Save lo (A) on stack while computing Y offset.
   pha
   lda z_idx
   asl
   clc
-  adc #7
+  adc #9
   tay
   pla
   sta (z_fp),y
@@ -2423,7 +2459,7 @@ z_call_apply_args:
   lda #7
   sta z_idx
 :
-  ldy #6
+  ldy #8
   lda (z_fp),y       ; num_locals from frame
   and #$0F
   cmp z_idx
@@ -2433,7 +2469,7 @@ z_call_apply_args:
   lda z_idx
   beq z_call_set_pc
   ; Apply args 1..argc from decoded call_arg_buf entries [1..argc].
-  ; localN is stored at frame offset 7 + (N-1)*2.
+  ; localN is stored at frame offset 9 + (N-1)*2.
   ldx #0
 z_call_apply_args_loop:
   cpx z_idx
@@ -2449,11 +2485,11 @@ z_call_apply_args_loop:
   iny
   lda call_arg_buf,y
   sta z_tmp2
-  ; dst offset = 7 + 2*x
+  ; dst offset = 9 + 2*x
   txa
   asl
   clc
-  adc #7
+  adc #9
   tay
   lda z_tmp
   sta (z_fp),y
@@ -2562,6 +2598,12 @@ z_return_word:
   iny
   lda (z_fp),y
   sta z_storevar
+  iny
+  lda (z_fp),y
+  sta z_sp
+  iny
+  lda (z_fp),y
+  sta z_sp+1
   iny
   lda (z_fp),y
   sta z_branch_cond
@@ -5018,6 +5060,12 @@ z_throw_unwind_loop:
   iny
   lda (z_fp),y
   sta z_story_target+1
+  ldy #6
+  lda (z_fp),y
+  sta z_sp
+  iny
+  lda (z_fp),y
+  sta z_sp+1
   lda z_fp
   sta z_callsp
   lda z_fp+1
@@ -6474,6 +6522,14 @@ z_dict_cache_store:
 
 ; Seek SD story stream to current VM PC for efficient subsequent static reads.
 z_seek_stream_to_pc:
+  ; SAVE/RESTORE and other FAT32 operations can leave fat32_readbuffer holding a
+  ; non-story sector while z_story_pos still matches the current PC. Force the
+  ; next seek to rebuild stream state from z_story_startcluster instead of taking
+  ; the "already at target position" fast path against stale buffer contents.
+  lda #$FF
+  sta z_story_pos
+  sta z_story_pos+1
+  sta z_story_pos+2
   lda z_pc
   sta z_story_target
   lda z_pc+1
@@ -6720,6 +6776,7 @@ z_save_snapshot_done:
   bcc :+
   jmp z_save_snapshot_fail
 :
+  jsr story_rewind_open
   jsr z_seek_stream_to_pc
   lda #1
   sta z_save_valid
@@ -6727,6 +6784,7 @@ z_save_snapshot_done:
   rts
 
 z_save_snapshot_fail:
+  jsr story_rewind_open
   jsr z_seek_stream_to_pc
   lda #0
   sta z_save_valid
@@ -6929,6 +6987,209 @@ z_save_snapshot_size:
   sta z_work_cnt+1
   lda z_work_cnt
   ldx z_work_cnt+1
+  rts
+
+; Build an 8.3 companion filename from the current story name.
+; Input A/X/Y = extension bytes 0..2. Output in z_stream_filename_buf.
+build_stream_filename:
+  sta z_tmp
+  stx z_tmp2
+  sty z_idx
+  ldx #0
+:
+  cpx #8
+  beq :+
+  lda story_name,x
+  sta z_stream_filename_buf,x
+  inx
+  bne :-
+:
+  lda z_tmp
+  sta z_stream_filename_buf+8
+  lda z_tmp2
+  sta z_stream_filename_buf+9
+  lda z_idx
+  sta z_stream_filename_buf+10
+  rts
+
+build_script_filename:
+  lda #'S'
+  ldx #'C'
+  ldy #'R'
+  jmp build_stream_filename
+
+build_transcript_filename:
+  lda #'T'
+  ldx #'R'
+  ldy #'N'
+  jmp build_stream_filename
+
+; Buffer one character for transcript stream 2.
+; Input: A=character. C clear on return.
+z_out2_buffer_char:
+  pha
+  lda z_out2_active
+  beq z_out2_buffer_done_pop
+  lda z_out2_trunc_ram
+  bne z_out2_buffer_done_pop
+  lda z_out2_len_ram+1
+  cmp #>(transcript_buffer_end-transcript_buffer)
+  bcc :+
+  bne z_out2_buffer_trunc
+  lda z_out2_len_ram
+  cmp #<(transcript_buffer_end-transcript_buffer)
+  bcs z_out2_buffer_trunc
+:
+  clc
+  lda z_out2_len_ram
+  adc #<transcript_buffer
+  sta z_work_ptr
+  lda z_out2_len_ram+1
+  adc #>transcript_buffer
+  sta z_work_ptr+1
+  pla
+  ldy #0
+  sta (z_work_ptr),y
+  inc z_out2_len_ram
+  bne :+
+  inc z_out2_len_ram+1
+: clc
+  rts
+z_out2_buffer_trunc:
+  lda #1
+  sta z_out2_trunc_ram
+z_out2_buffer_done_pop:
+  pla
+  clc
+  rts
+
+; Write the current transcript buffer to the companion .TRN file.
+; Overwrites any previous file. C clear on success.
+z_out2_write_file:
+  jsr build_transcript_filename
+  jsr fat32_openroot
+  ldx #<z_stream_filename_buf
+  ldy #>z_stream_filename_buf
+  jsr fat32_finddirent
+  bcs :+
+  jsr fat32_deletefile
+:
+  lda z_out2_len_ram
+  ora z_out2_len_ram+1
+  bne :+
+  jsr z_seek_stream_to_pc
+  clc
+  rts
+:
+  lda z_out2_len_ram
+  sta fat32_bytesremaining
+  lda z_out2_len_ram+1
+  sta fat32_bytesremaining+1
+  jsr fat32_allocatefile
+  bcc :+
+  jsr z_seek_stream_to_pc
+  sec
+  rts
+:
+  jsr fat32_openroot
+  lda #<z_stream_filename_buf
+  sta fat32_filenamepointer
+  lda #>z_stream_filename_buf
+  sta fat32_filenamepointer+1
+  lda z_out2_len_ram
+  sta fat32_bytesremaining
+  lda z_out2_len_ram+1
+  sta fat32_bytesremaining+1
+  jsr fat32_writedirent
+  bcc :+
+  jsr z_seek_stream_to_pc
+  sec
+  rts
+:
+  lda #<transcript_buffer
+  sta fat32_address
+  lda #>transcript_buffer
+  sta fat32_address+1
+  lda z_out2_len_ram
+  sta fat32_bytesremaining
+  lda z_out2_len_ram+1
+  sta fat32_bytesremaining+1
+  jsr fat32_file_write
+  jsr z_seek_stream_to_pc
+  clc
+  rts
+
+; Flush and disable transcript stream 2.
+z_out2_finalize:
+  lda z_out2_active
+  beq z_out2_finalize_done
+  jsr z_out2_write_file
+  lda #0
+  sta z_out2_active
+  sta z_out2_len_ram
+  sta z_out2_len_ram+1
+  sta z_out2_trunc_ram
+z_out2_finalize_done:
+  rts
+
+; Read the next byte from the per-story script companion file.
+; Returns A=byte with C clear, or C set on EOF/missing file.
+z_script_read_char:
+  lda z_story_booted
+  bne :+
+  sec
+  rts
+:
+  jsr build_script_filename
+  jsr fat32_openroot
+  ldx #<z_stream_filename_buf
+  ldy #>z_stream_filename_buf
+  jsr fat32_finddirent
+  bcc :+
+  jsr z_seek_stream_to_pc
+  sec
+  rts
+:
+  jsr fat32_opendirent
+  lda #<(fat32_readbuffer+$200)
+  sta zp_sd_address
+  lda #>(fat32_readbuffer+$200)
+  sta zp_sd_address+1
+  lda z_script_pos
+  sta z_work_cnt
+  lda z_script_pos+1
+  sta z_work_cnt+1
+z_script_skip_loop:
+  lda z_work_cnt
+  ora z_work_cnt+1
+  beq z_script_read_now
+  jsr fat32_file_readbyte
+  bcc :+
+  jsr z_seek_stream_to_pc
+  sec
+  rts
+:
+  lda z_work_cnt
+  bne :+
+  dec z_work_cnt+1
+:
+  dec z_work_cnt
+  jmp z_script_skip_loop
+z_script_read_now:
+  jsr fat32_file_readbyte
+  bcc :+
+  jsr z_seek_stream_to_pc
+  sec
+  rts
+:
+  pha
+  inc z_script_pos
+  bne :+
+  inc z_script_pos+1
+:
+  jsr z_seek_stream_to_pc
+  pla
+  clc
   rts
 
 ; Build the per-story save filename in z_save_filename_buf.
@@ -7137,6 +7398,7 @@ op_rfalse:
   jmp z_return_word
 
 op_quit:
+  jsr z_out2_finalize
   jsr newline
   ldx #<msg_quit
   ldy #>msg_quit
@@ -7172,57 +7434,60 @@ z_store_ax_following:
 
 op_save:
   jsr z_save_snapshot
+  ; Preserve the save result before the version check clobbers carry.
+  bcc :+
+  lda #0
+  bne :++
+: lda #1
+: sta z_tmp
   lda z_story_version
   cmp #4
   bcc z_save_branch
-  bcs z_save_store
+  jmp z_save_store
 
 z_save_branch:
-  bcc :+
-  lda #0
-  jmp z_branch_on_bool
-:
-  lda #1
+  lda z_tmp
   jmp z_branch_on_bool
 
 z_save_store:
-  bcc :+
-  lda #0
-  tax
-  jmp z_store_ax_following
-:
-  lda #1
+  lda z_tmp
   ldx #0
   jmp z_store_ax_following
 
 op_restore:
   jsr z_restore_snapshot
+  ; Save the restore outcome before version dispatch.  In V1-3 the branch
+  ; operand is ignored, so both success and failure simply continue after the
+  ; relevant branch bytes.  On successful restore the saved PC points at the
+  ; original SAVE's branch operand, so passing false skips the branch and
+  ; continues after the instruction as required by the spec.
+  bcc :+
+  lda #0
+  sta z_tmp
+  beq :++
+: lda z_story_version
+  cmp #4
+  bcc :+
+  lda #2
+  bne :++
+: lda #0
+: sta z_tmp
   lda z_story_version
   cmp #4
   bcc z_restore_branch
-  bcs z_restore_store
+  jmp z_restore_store
 
 z_restore_branch:
-  bcc :+
-  lda #0
-  jmp z_branch_on_bool
-:
-  ; Successful restore resumes at the saved SAVE opcode's branch path.
-  lda #1
+  lda z_tmp
   jmp z_branch_on_bool
 
 z_restore_store:
-  bcc :+
-  lda #0
-  tax
-  jmp z_store_ax_following
-:
-  ; Successful restore resumes at the saved SAVE opcode's store result.
-  lda #2
+  lda z_tmp
   ldx #0
   jmp z_store_ax_following
 
 op_restart:
+  jsr z_out2_finalize
   jsr boot_story
   clc
   rts
@@ -7648,12 +7913,6 @@ op_sread_var:
   bcc :+
   jmp zm_stop
 :
-  ; Script input stream is not implemented yet; fall back to keyboard.
-  lda z_input_stream
-  beq :+
-  lda #0
-  sta z_input_stream
-:
   ; text buffer base in op1, parse buffer base in op2
   lda z_op1_lo
   ldx z_op1_hi
@@ -7705,6 +7964,11 @@ z_sread_loop:
   cmp #$7F
   beq z_sread_backspace
   sta z_tmp
+  lda z_last_input_script
+  beq :+
+  lda z_tmp
+  jsr z_vm_put_char
+:
   lda z_idx
   cmp z_work_cnt
   bcs z_sread_loop
@@ -7754,7 +8018,7 @@ z_sread_cr:
 
 z_sread_done:
   ; Move game output to next line after Enter.
-  jsr newline
+  jsr z_vm_newline
   lda z_story_version
   cmp #5
   bcc z_sread_done_v14
@@ -7832,7 +8096,7 @@ z_sread_finish_result:
 ; v5+: write count=0 to text+1, skip parse, store 0 as terminator.
 ; v1-v4: timed input not spec'd; just return cleanly with no parse.
 z_sread_timeout:
-  jsr newline
+  jsr z_vm_newline
   lda z_story_version
   cmp #5
   bcc :+
@@ -7868,6 +8132,15 @@ z_timed_get_char:
   jmp get_key                 ; no timeout: tail-call blocking read
 :
 z_tgc_poll:
+  lda z_input_stream
+  beq z_tgc_poll_kbd
+  jsr z_script_read_char
+  bcc z_tgc_script_done
+  lda #0
+  sta z_input_stream
+z_tgc_poll_kbd:
+  lda #0
+  sta z_last_input_script
   jsr get_input               ; emulator: returns 0x00 when no key queued
   and #$7F
   bne z_tgc_done              ; got a key -> return it
@@ -7892,6 +8165,10 @@ z_tgc_rearm:
   jmp z_tgc_poll
 z_tgc_timeout:
   lda #0                      ; signal abort
+  rts
+z_tgc_script_done:
+  lda #1
+  sta z_last_input_script
   rts
 z_tgc_done:
   rts
@@ -9108,13 +9385,20 @@ op_input_stream_var:
   bcc :+
   jmp zm_stop
 :
-  ; Track requested stream. Keyboard (0) is always supported; script input
-  ; stream (1) is tracked but currently falls back to keyboard at read time.
   lda z_op1_lo
   cmp #1
-  beq :+
+  beq z_input_stream_script
   lda #0
-: sta z_input_stream
+  sta z_input_stream
+  sta z_last_input_script
+  clc
+  rts
+z_input_stream_script:
+  lda #0
+  sta z_script_pos
+  sta z_script_pos+1
+  lda #1
+  sta z_input_stream
   clc
   rts
 
@@ -9160,6 +9444,8 @@ z_rdc_poll:
   beq z_read_char_store       ; BS → ZSCII 8 (GETCH already moved cursor back)
   cmp #$7F
   beq z_read_char_del         ; DEL → ZSCII 8
+  lda z_last_input_script
+  bne z_read_char_store_keep
   ; Printable char: suppress the GETCH echo with BS+space+BS.
   pha
   lda #$08
@@ -9169,6 +9455,7 @@ z_rdc_poll:
   lda #$08
   jsr print_char
   pla
+z_read_char_store_keep:
 z_read_char_store:
   ldx #0
   jmp z_store_ax_following
@@ -9315,7 +9602,7 @@ op_check_arg_count_var:
   lda z_op1_lo
   beq z_check_arg_count_false
   sta z_tmp
-  ldy #6
+  ldy #8
   lda (z_fp),y
   lsr
   lsr
@@ -9340,6 +9627,18 @@ op_output_stream_var:
   lda z_op1_hi
   bmi z_output_stream_disable
   lda z_op1_lo
+  cmp #2
+  bne :+
+  lda z_out2_active
+  bne z_output_stream_done
+  lda #0
+  sta z_out2_len_ram
+  sta z_out2_len_ram+1
+  sta z_out2_trunc_ram
+  lda #1
+  sta z_out2_active
+  jmp z_output_stream_done
+:
   cmp #3
   bne :+
   ; Enable stream 3 (memory table at operand 2).
@@ -9362,11 +9661,18 @@ op_output_stream_var:
   sta z_out3_len+1
   lda #1
   sta z_out3_active
-: clc
+: z_output_stream_done:
+  clc
   rts
 
 z_output_stream_disable:
   lda z_op1_lo
+  cmp #$FE                    ; -2
+  bne :+
+  jsr z_out2_finalize
+  clc
+  rts
+:
   cmp #$FD                    ; -3
   bne :+
   lda z_out3_active
@@ -9911,8 +10217,6 @@ z_process_no_escape:
   bcs z_decode_fail
   lda #0
   sta z_zs_abbrev
-  sta z_zs_shift
-  sta z_zs_shift_once
   clc
   rts
 
@@ -10218,6 +10522,8 @@ z_expand_abbrev:
   pha
   lda z_zs_shift       ; save shift state (abbrev padding leaves z_zs_shift=2)
   pha
+  lda z_zs_shift_once
+  pha
   lda z_zs_endflag     ; preserve outer-string termination flag across recursion
   pha
 
@@ -10238,6 +10544,8 @@ z_expand_abbrev:
 z_expand_restore:
   pla                  ; restore outer z_zs_endflag (pushed last)
   sta z_zs_endflag
+  pla                  ; restore z_zs_shift_once
+  sta z_zs_shift_once
   pla                  ; restore z_zs_shift
   sta z_zs_shift
   pla
@@ -10300,7 +10608,14 @@ z_vm_put_char_mem_fail:
   clc
   rts
 z_vm_put_char_console:
+  lda z_out2_active
+  bne :+
   jmp print_char
+:
+  pha
+  jsr print_char
+  pla
+  jmp z_out2_buffer_char
 
 ; VM newline helper honoring stream 3.
 z_vm_newline:
@@ -10308,7 +10623,12 @@ z_vm_newline:
   beq :+
   lda #$0D
   jmp z_vm_put_char
-: jmp newline
+: lda z_out2_active
+  bne :+
+  jmp newline
+: jsr newline
+  lda #$0D
+  jmp z_out2_buffer_char
 
 ;------------------------------------------------------------
 ; Console helper

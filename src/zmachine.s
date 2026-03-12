@@ -3266,10 +3266,10 @@ z_prop_find_object_prop:
   lda z_tmp2
   and #$1F
   asl
-  sta z_tmp
   clc
-  lda z_work_ptr
   adc #1
+  sta z_tmp
+  lda z_work_ptr
   adc z_tmp
   sta z_prop_ptr
   lda z_work_ptr+1
@@ -4800,10 +4800,10 @@ op_2op_get_next_prop:
   lda z_tmp2
   and #$1F
   asl
-  sta z_tmp
   clc
-  lda z_work_ptr
   adc #1
+  sta z_tmp
+  lda z_work_ptr
   adc z_tmp
   sta z_prop_ptr
   lda z_work_ptr+1

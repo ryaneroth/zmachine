@@ -7085,6 +7085,9 @@ z_out2_write_file:
   sta fat32_bytesremaining
   lda z_out2_len_ram+1
   sta fat32_bytesremaining+1
+  lda #0
+  sta fat32_bytesremaining+2
+  sta fat32_bytesremaining+3
   jsr fat32_allocatefile
   bcc :+
   jsr z_seek_stream_to_pc
@@ -7100,6 +7103,9 @@ z_out2_write_file:
   sta fat32_bytesremaining
   lda z_out2_len_ram+1
   sta fat32_bytesremaining+1
+  lda #0
+  sta fat32_bytesremaining+2
+  sta fat32_bytesremaining+3
   jsr fat32_writedirent
   bcc :+
   jsr z_seek_stream_to_pc
@@ -7114,6 +7120,9 @@ z_out2_write_file:
   sta fat32_bytesremaining
   lda z_out2_len_ram+1
   sta fat32_bytesremaining+1
+  lda #0
+  sta fat32_bytesremaining+2
+  sta fat32_bytesremaining+3
   jsr fat32_file_write
   jsr z_seek_stream_to_pc
   clc
@@ -7235,6 +7244,9 @@ z_save_snapshot_sd_write:
   sta fat32_bytesremaining
   lda z_div_q_hi
   sta fat32_bytesremaining+1
+  lda #0
+  sta fat32_bytesremaining+2
+  sta fat32_bytesremaining+3
   jsr fat32_allocatefile
   bcc :+
   sec
@@ -7250,6 +7262,9 @@ z_save_snapshot_sd_write:
   sta fat32_bytesremaining
   lda z_div_q_hi
   sta fat32_bytesremaining+1
+  lda #0
+  sta fat32_bytesremaining+2
+  sta fat32_bytesremaining+3
   jsr fat32_writedirent
   bcc :+
   sec
@@ -7264,6 +7279,9 @@ z_save_snapshot_sd_write:
   sta fat32_bytesremaining
   lda z_div_q_hi
   sta fat32_bytesremaining+1
+  lda #0
+  sta fat32_bytesremaining+2
+  sta fat32_bytesremaining+3
   jsr fat32_file_write
   clc
   rts
@@ -7320,31 +7338,10 @@ z_save_snapshot_sd_read_fail:
   rts
 :
   lda #<save_buffer
-  sta z_work_ptr
+  sta fat32_address
   lda #>save_buffer
-  sta z_work_ptr+1
-z_save_sd_read_loop:
-  lda z_work_cnt
-  ora z_work_cnt+1
-  beq z_save_sd_read_done
-  jsr fat32_file_readbyte
-  bcc :+
-  sec
-  rts
-:
-  ldy #0
-  sta (z_work_ptr),y
-  inc z_work_ptr
-  bne :+
-  inc z_work_ptr+1
-:
-  lda z_work_cnt
-  bne :+
-  dec z_work_cnt+1
-:
-  dec z_work_cnt
-  jmp z_save_sd_read_loop
-
+  sta fat32_address+1
+  jsr fat32_file_read
 z_save_sd_read_done:
   ; Validate declared snapshot size matches file size.
   jsr z_save_snapshot_size
@@ -7456,11 +7453,9 @@ z_save_store:
 
 op_restore:
   jsr z_restore_snapshot
-  ; Save the restore outcome before version dispatch.  In V1-3 the branch
-  ; operand is ignored, so both success and failure simply continue after the
-  ; relevant branch bytes.  On successful restore the saved PC points at the
-  ; original SAVE's branch operand, so passing false skips the branch and
-  ; continues after the instruction as required by the spec.
+  ; Save the restore outcome before version dispatch. In V1-3 restore resumes
+  ; as though the original SAVE succeeded, so the branch must be taken on
+  ; success and fall through on failure.
   bcc :+
   lda #0
   sta z_tmp
@@ -7470,7 +7465,7 @@ op_restore:
   bcc :+
   lda #2
   bne :++
-: lda #0
+: lda #1
 : sta z_tmp
   lda z_story_version
   cmp #4
@@ -10608,7 +10603,7 @@ z_vm_put_char_mem_fail:
   clc
   rts
 z_vm_put_char_console:
-  lda z_out2_active
+  ldx z_out2_active
   bne :+
   jmp print_char
 :

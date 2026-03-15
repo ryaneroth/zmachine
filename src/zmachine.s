@@ -2188,16 +2188,17 @@ z_get_local_word:
   sbc #1
   asl
   sta z_work_ptr
+  clc
+  adc #9
+  sta z_work_ptr
   lda #0
   rol
   sta z_work_ptr+1
   clc
   lda z_fp
-  adc #9
   adc z_work_ptr
   sta z_work_ptr
   lda z_fp+1
-  adc #0
   adc z_work_ptr+1
   sta z_work_ptr+1
   ldy #0
@@ -2226,16 +2227,17 @@ z_set_local_word:
   sbc #1
   asl
   sta z_work_ptr
+  clc
+  adc #9
+  sta z_work_ptr
   lda #0
   rol
   sta z_work_ptr+1
   clc
   lda z_fp
-  adc #9
   adc z_work_ptr
   sta z_work_ptr
   lda z_fp+1
-  adc #0
   adc z_work_ptr+1
   sta z_work_ptr+1
   ldy #0
@@ -5899,6 +5901,70 @@ z_div_next:
   clc
   rts
 
+; z_divmod_u16: unsigned 16-bit divide z_op1 / z_op2
+; quotient -> z_work_ptr, remainder -> z_branch_off
+; C set on divide-by-zero
+z_divmod_u16:
+  lda z_op2_lo
+  ora z_op2_hi
+  bne :+
+  sec
+  rts
+:
+  lda z_op1_lo
+  sta z_div_d_lo
+  lda z_op1_hi
+  sta z_div_d_hi
+  lda z_op2_lo
+  sta z_div_v_lo
+  lda z_op2_hi
+  sta z_div_v_hi
+  lda #0
+  sta z_div_r_lo
+  sta z_div_r_hi
+  sta z_div_q_lo
+  sta z_div_q_hi
+  ldx #16
+z_div_u_loop:
+  asl z_div_d_lo
+  rol z_div_d_hi
+  rol z_div_r_lo
+  rol z_div_r_hi
+  asl z_div_q_lo
+  rol z_div_q_hi
+  lda z_div_r_hi
+  cmp z_div_v_hi
+  bcc z_div_u_next
+  bne z_div_u_sub
+  lda z_div_r_lo
+  cmp z_div_v_lo
+  bcc z_div_u_next
+z_div_u_sub:
+  sec
+  lda z_div_r_lo
+  sbc z_div_v_lo
+  sta z_div_r_lo
+  lda z_div_r_hi
+  sbc z_div_v_hi
+  sta z_div_r_hi
+  inc z_div_q_lo
+  bne z_div_u_next
+  inc z_div_q_hi
+z_div_u_next:
+  dex
+  bne z_div_u_loop
+
+  lda z_div_q_lo
+  sta z_work_ptr
+  lda z_div_q_hi
+  sta z_work_ptr+1
+  lda z_div_r_lo
+  sta z_branch_off
+  lda z_div_r_hi
+  sta z_branch_off_hi
+  clc
+  rts
+
 z_neg_d:
   lda z_div_d_lo
   eor #$FF
@@ -9215,7 +9281,7 @@ z_random_positive:
   sta z_op1_lo
   lda z_rng_state_hi
   sta z_op1_hi
-  jsr z_divmod_16
+  jsr z_divmod_u16
   bcc :+
   jmp zm_stop
 :

@@ -6128,6 +6128,15 @@ z_encode_v45_loop:
   bcs :+
   ora #$20
 :
+  cmp #$22
+  bne :+
+  ldx z_idx
+  cpx #0
+  bne z_encode_v45_next
+  lda #25
+  sta call_arg_buf+1
+  jmp z_encode_v45_pack
+:
   cmp #'a'
   bcc z_encode_v45_next
   cmp #'z'+1
@@ -6235,6 +6244,15 @@ z_encode_loop:
   cmp #'Z'+1
   bcs :+
   ora #$20
+:
+  cmp #$22
+  bne :+
+  ldx z_idx
+  cpx #0
+  bne z_encode_char_done
+  lda #25
+  sta z_div_d_hi
+  jmp z_encode_pack
 :
   cmp #'a'
   bcc z_encode_char_done
@@ -8394,10 +8412,18 @@ z_tokenise_token_start_found:
   lda z_work_ptr
   ldx z_work_ptr+1
   jsr z_mem_read_byte_ax
+  sta z_tmp
+  cmp #$22
+  bne :+
+  lda #1
+  sta z_tok_len
+  jmp z_tokenise_token_ready
+:
   lda z_prop_ptr
   sta menu_ptr
   lda z_prop_ptr+1
   sta menu_ptr+1
+  lda z_tmp
   jsr z_dict_is_separator
   lda menu_ptr
   sta z_prop_ptr
@@ -8426,12 +8452,16 @@ z_tokenise_count_token:
   lda z_work_ptr
   ldx z_work_ptr+1
   jsr z_mem_read_byte_ax
+  sta z_tmp
   cmp #' '
+  beq z_tokenise_token_ready
+  cmp #$22
   beq z_tokenise_token_ready
   lda z_prop_ptr
   sta menu_ptr
   lda z_prop_ptr+1
   sta menu_ptr+1
+  lda z_tmp
   jsr z_dict_is_separator
   lda menu_ptr
   sta z_prop_ptr
@@ -8448,6 +8478,7 @@ z_tokenise_token_ready:
   sta menu_ptr+1
   jsr z_encode_token_key
   jsr z_dict_lookup_token
+z_tokenise_token_ready_restore_ptr:
   lda menu_ptr
   sta z_prop_ptr
   lda menu_ptr+1

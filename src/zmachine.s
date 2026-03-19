@@ -5531,7 +5531,10 @@ op_1op_print_paddr:
   rts
 
 op_1op_load:
-  lda z_op1_varid
+  ; load/value uses the decoded operand value as the variable number.
+  ; Using the raw operand slot breaks forms like VALUE <GETB ...>, where
+  ; the operand is a temp holding the real variable id.
+  lda z_op1_lo
   jsr z_get_var_word
   sta z_work_ptr
   stx z_work_ptr+1
@@ -6084,10 +6087,65 @@ z_print_digit_emit_yes:
 z_print_digit_skip:
   rts
 
+; Input A=ASCII char.
+; C set and A=zchar if char is present in the V2+ A2 table.
+z_encode_lookup_a2_char:
+  sta z_tmp
+  ldx #0
+z_encode_lookup_a2_char_loop:
+  lda z_a2_table,x
+  cmp z_tmp
+  beq z_encode_lookup_a2_char_found
+  inx
+  cpx #24
+  bcc z_encode_lookup_a2_char_loop
+  lda z_tmp
+  clc
+  rts
+z_encode_lookup_a2_char_found:
+  txa
+  clc
+  adc #8
+  sta z_tmp
+  sec
+  lda z_tmp
+  rts
+
+; Input X=slot index 0..5, A=zchar.
+z_encode_store_zchar_v13:
+  cpx #0
+  bne :+
+  sta z_div_d_lo
+  rts
+:
+  cpx #1
+  bne :+
+  sta z_div_d_hi
+  rts
+:
+  cpx #2
+  bne :+
+  sta z_div_v_lo
+  rts
+:
+  cpx #3
+  bne :+
+  sta z_div_v_hi
+  rts
+:
+  cpx #4
+  bne :+
+  sta z_div_r_lo
+  rts
+:
+  sta z_div_r_hi
+  rts
+
 ; Encode token at text buffer (op1) using z_tok_start/z_tok_len.
 ; V1-3 produce 4 bytes in z_enc0..z_enc3.
 ; V4+ produce 6 bytes in z_enc0..z_enc3 + z_enc4_ram/z_enc5_ram.
-; Current encoder maps lowercase a-z directly and pads all other chars with 5.
+; Lowercase a-z map directly; one-char A2 punctuation tokens map as shift-5
+; followed by their punctuation zchar so addressed commands tokenize properly.
 z_encode_token_key:
   lda z_story_version
   cmp #4
@@ -6128,23 +6186,29 @@ z_encode_v45_loop:
   bcs :+
   ora #$20
 :
-  cmp #$22
-  bne :+
-  ldx z_idx
-  cpx #0
-  bne z_encode_v45_next
-  lda #25
-  sta call_arg_buf+1
-  jmp z_encode_v45_pack
-:
   cmp #'a'
-  bcc z_encode_v45_next
+  bcc z_encode_v45_try_a2
   cmp #'z'+1
-  bcs z_encode_v45_next
+  bcs z_encode_v45_try_a2
   sec
   sbc #'a'-6
   ldx z_idx
   sta call_arg_buf,x
+  jmp z_encode_v45_next
+
+z_encode_v45_try_a2:
+  jsr z_encode_lookup_a2_char
+  bcc z_encode_v45_next
+  sta z_tmp
+  ldx z_idx
+  cpx #8
+  bcs z_encode_v45_pack
+  lda #5
+  sta call_arg_buf,x
+  inx
+  lda z_tmp
+  sta call_arg_buf,x
+  stx z_idx
 z_encode_v45_next:
   ldx z_idx
   inx
@@ -6245,48 +6309,29 @@ z_encode_loop:
   bcs :+
   ora #$20
 :
-  cmp #$22
-  bne :+
-  ldx z_idx
-  cpx #0
-  bne z_encode_char_done
-  lda #25
-  sta z_div_d_hi
-  jmp z_encode_pack
-:
   cmp #'a'
-  bcc z_encode_char_done
+  bcc z_encode_try_a2
   cmp #'z'+1
-  bcs z_encode_char_done
+  bcs z_encode_try_a2
   sec
   sbc #'a'-6
   ldx z_idx
-  cpx #0
-  bne :+
-  sta z_div_d_lo
+  jsr z_encode_store_zchar_v13
   jmp z_encode_char_done
-:
-  cpx #1
-  bne :+
-  sta z_div_d_hi
-  jmp z_encode_char_done
-:
-  cpx #2
-  bne :+
-  sta z_div_v_lo
-  jmp z_encode_char_done
-:
-  cpx #3
-  bne :+
-  sta z_div_v_hi
-  jmp z_encode_char_done
-:
-  cpx #4
-  bne :+
-  sta z_div_r_lo
-  jmp z_encode_char_done
-:
-  sta z_div_r_hi
+
+z_encode_try_a2:
+  jsr z_encode_lookup_a2_char
+  bcc z_encode_char_done
+  sta z_tmp
+  ldx z_idx
+  cpx #5
+  bcs z_encode_pack
+  lda #5
+  jsr z_encode_store_zchar_v13
+  inx
+  lda z_tmp
+  jsr z_encode_store_zchar_v13
+  inc z_idx
 z_encode_char_done:
   inc z_idx
   jmp z_encode_loop
@@ -8414,8 +8459,10 @@ z_tokenise_token_start_found:
   jsr z_mem_read_byte_ax
   sta z_tmp
   cmp #$22
-  bne :+
-  lda #1
+  beq :+
+  cmp #','
+  bne :++
+: lda #1
   sta z_tok_len
   jmp z_tokenise_token_ready
 :
@@ -8456,6 +8503,8 @@ z_tokenise_count_token:
   cmp #' '
   beq z_tokenise_token_ready
   cmp #$22
+  beq z_tokenise_token_ready
+  cmp #','
   beq z_tokenise_token_ready
   lda z_prop_ptr
   sta menu_ptr

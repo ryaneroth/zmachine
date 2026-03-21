@@ -9350,12 +9350,14 @@ z_random_positive:
   clc
   lda z_rng_state_lo
   adc z_tmp
-  adc #1
   sta z_rng_state_lo
   lda z_rng_state_hi
   adc z_tmp2
-  adc #0
   sta z_rng_state_hi
+  inc z_rng_state_lo
+  bne :+
+  inc z_rng_state_hi
+: 
   ; result = (state mod n) + 1, using z_divmod_16(op1/op2)
   lda z_rng_state_lo
   sta z_op1_lo
